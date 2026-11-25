@@ -2,6 +2,10 @@
 
 A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5 (or any Linux machine with Python 3.9+). It uses only the Python standard library, so there's nothing to `pip install`.
 
+![Claude Pulse dashboard](docs/preview.png)
+
+*(Screenshot uses sample data.)*
+
 **What it shows**
 
 - **ANT stock.** Live quote, the change today and against the $83 IPO price, the day range, volume and an estimated market cap. The chart covers 1 day, 4 days or every day since the IPO, with pre-market and after-hours shaded. It also lists Nasdaq, NVDA, GOOGL, AMZN and MSFT for context.
