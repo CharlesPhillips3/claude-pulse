@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""
+Claude Pulse - a local dashboard for Anthropic / Claude.
+
+Runs on a Raspberry Pi (or any Linux box) using only the Python standard
+library. Background threads collect:
+  * ANT stock quotes + intraday history (Yahoo Finance, Stooq fallback)
+  * Claude service status, incidents and maintenance (status.claude.com)
+  * Model speed probes + API rate-limit headroom (optional API key)
+  * Available models from the API (detects newly released models)
+  * News headlines (Google News RSS) tagged for releases / stock / outages
+and stores history in SQLite so the charts can show the last few days.
+"""
+import json
+import os
+import re
+import sqlite3
+import statistics
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(APP_DIR, "static")
+DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
+CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
+ET_TZ = ZoneInfo("America/New_York")
+VERSION = "1.0.0"
+
+DEFAULT_CONFIG = {
+    "bind": "0.0.0.0",
+    "port": 8787,
+    "ticker": "ANT",
+    "ipo_price": 83.0,
+    "ipo_date": "2026-11-19",
+    "shares_outstanding": 13.37e9,
+    "peers": ["^IXIC", "NVDA", "GOOGL", "AMZN", "MSFT"],
+    "anthropic_api_key": "",
+    "probe_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"],
+    "probe_interval_min": 15,
+    "status_base": "https://status.claude.com",
+    "status_fallback": "https://status.anthropic.com",
+    "news_queries": ["Anthropic Claude", "Anthropic stock ANT", "Claude new model"],
+    "history_keep_days": 45,
+    "offline": False,
+}
+
+# NYSE/Nasdaq full-day holidays and 1 p.m. early closes.
+HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+EARLY_CLOSE = {"2026-11-27", "2026-12-24", "2027-11-26"}
+
+UA = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36 ClaudePulse/" + VERSION
+
+
+# --------------------------------------------------------------------------- config
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # bad JSON should not kill the app
+        print(f"[config] could not read {CONFIG_PATH}: {e}", file=sys.stderr)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        cfg["anthropic_api_key"] = os.environ["ANTHROPIC_API_KEY"]
+    if os.environ.get("CLAUDE_PULSE_PORT"):
+        cfg["port"] = int(os.environ["CLAUDE_PULSE_PORT"])
+    if os.environ.get("CLAUDE_PULSE_OFFLINE") == "1":
+        cfg["offline"] = True
+    return cfg
+
+
+CFG = load_config()
+
+
+# --------------------------------------------------------------------------- storage
+
+class DB:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.Lock()
+        with self.lock:
+            c = self.conn
+            c.execute("PRAGMA journal_mode=WAL")
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS stock (symbol TEXT, ts INTEGER, price REAL, volume REAL,
+                PRIMARY KEY(symbol, ts));
+            CREATE TABLE IF NOT EXISTS daily (symbol TEXT, day TEXT, open REAL, high REAL, low REAL,
+                close REAL, volume REAL, PRIMARY KEY(symbol, day));
+            CREATE TABLE IF NOT EXISTS status_snap (ts INTEGER, component TEXT, state TEXT);
+            CREATE INDEX IF NOT EXISTS status_snap_ts ON status_snap(ts);
+            CREATE TABLE IF NOT EXISTS probe (ts INTEGER, model TEXT, ok INTEGER, ttft REAL, total REAL,
+                out_tokens INTEGER, tps REAL, error TEXT);
+            CREATE INDEX IF NOT EXISTS probe_ts ON probe(ts);
+            CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+            """)
+            c.commit()
+
+    def execute(self, sql, args=(), many=False):
+        with self.lock:
+            cur = self.conn.executemany(sql, args) if many else self.conn.execute(sql, args)
+            self.conn.commit()
+            return cur
+
+    def query(self, sql, args=()):
+        with self.lock:
+            return self.conn.execute(sql, args).fetchall()
+
+    def kv_get(self, key, default=None):
+        rows = self.query("SELECT value FROM kv WHERE key=?", (key,))
+        if not rows:
+            return default
+        try:
+            return json.loads(rows[0][0])
+        except Exception:
+            return default
+
+    def kv_set(self, key, value):
+        self.execute("INSERT OR REPLACE INTO kv(key, value) VALUES(?, ?)", (key, json.dumps(value)))
+
+
+DB_ = DB(os.path.join(DATA_DIR, "pulse.db"))
+
+STATE_LOCK = threading.Lock()
+STATE = {
+    "quote": None,
+    "peers": [],
+    "status": None,
+    "recent_incidents": [],
+    "upcoming_maint": [],
+    "probes": {},
+    "rate_limits": None,
+    "available_models": [],
+    "news": [],
+    "jobs": {},
+}
+
+
+def set_state(key, value):
+    with STATE_LOCK:
+        STATE[key] = value
+
+
+def job_ok(name, note=None):
+    with STATE_LOCK:
+        j = STATE["jobs"].setdefault(name, {})
+        j["ok_at"] = int(time.time())
+        j["err"] = None
+        if note:
+            j["note"] = note
+
+
+def job_err(name, err):
+    with STATE_LOCK:
+        j = STATE["jobs"].setdefault(name, {})
+        j["err"] = str(err)[:300]
+        j["err_at"] = int(time.time())
+
+
+# --------------------------------------------------------------------------- http helpers
+
+def fetch(url, headers=None, data=None, timeout=20, method=None):
+    if CFG.get("offline"):
+        raise RuntimeError("offline mode")
+    h = {"User-Agent": UA, "Accept": "*/*"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+
+
+def fetch_json(url, **kw):
+    _, _, body = fetch(url, **kw)
+    return json.loads(body)
+
+
+def iso_to_ts(s):
+    if not s:
+        return None
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- market clock
+
+def market_state(now=None):
+    now = now or datetime.now(ET_TZ)
+    d = now.date().isoformat()
+    if now.weekday() >= 5 or d in HOLIDAYS:
+        return "closed"
+    t = now.hour * 60 + now.minute
+    early = d in EARLY_CLOSE
+    close = 13 * 60 if early else 16 * 60
+    post_end = 17 * 60 if early else 20 * 60
+    if 4 * 60 <= t < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= t < close:
+        return "open"
+    if close <= t < post_end:
+        return "post"
+    return "closed"
+
+
+def next_market_open(now=None):
+    now = now or datetime.now(ET_TZ)
+    d = now
+    for _ in range(10):
+        cand = d.replace(hour=9, minute=30, second=0, microsecond=0)
+        if cand > now and cand.weekday() < 5 and cand.date().isoformat() not in HOLIDAYS:
+            return int(cand.timestamp())
+        d = (d + timedelta(days=1)).replace(hour=0, minute=0)
+    return None
+
+
+# --------------------------------------------------------------------------- stock
+
+def yahoo_chart(symbol, rng, interval, prepost=False):
+    q = urllib.parse.urlencode({"range": rng, "interval": interval,
+                                "includePrePost": "true" if prepost else "false"})
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            j = fetch_json(f"https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{q}",
+                           headers={"Accept": "application/json"})
+            res = (j.get("chart") or {}).get("result")
+            if res:
+                return res[0]
+            last = RuntimeError(json.dumps((j.get("chart") or {}).get("error"))[:200])
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("no data")
+
+
+def series_points(res):
+    ts = res.get("timestamp") or []
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = q.get("close") or []
+    vols = q.get("volume") or []
+    out = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        if c is None:
+            continue
+        v = vols[i] if i < len(vols) else None
+        out.append((int(t), float(c), float(v) if v is not None else None))
+    return out
+
+
+def stooq_quote(symbol):
+    _, _, b = fetch(f"https://stooq.com/q/l/?s={symbol.lower()}.us&f=sd2t2ohlcv&h&e=csv")
+    lines = b.decode("utf-8", "replace").strip().splitlines()
+    d = dict(zip(lines[0].split(","), lines[1].split(",")))
+    return {"price": float(d["Close"]), "day_high": float(d["High"]), "day_low": float(d["Low"]),
+            "open": float(d["Open"]), "volume": float(d["Volume"])}
+
+
+def collect_stock():
+    sym = CFG["ticker"]
+    quote = {"symbol": sym, "ipo_price": CFG["ipo_price"], "updated": int(time.time())}
+    try:
+        r1 = yahoo_chart(sym, "1d", "1m", prepost=True)
+        m = r1.get("meta", {})
+        pts = series_points(r1)
+        price = m.get("regularMarketPrice")
+        prev = m.get("chartPreviousClose") or m.get("previousClose")
+        quote.update({
+            "source": "Yahoo Finance",
+            "name": m.get("longName") or m.get("shortName") or "Anthropic, PBC",
+            "price": price,
+            "prev_close": prev,
+            "day_high": m.get("regularMarketDayHigh"),
+            "day_low": m.get("regularMarketDayLow"),
+            "volume": m.get("regularMarketVolume"),
+            "high52": m.get("fiftyTwoWeekHigh"),
+            "low52": m.get("fiftyTwoWeekLow"),
+            "market_time": m.get("regularMarketTime"),
+        })
+        # Latest extended-hours trade (pre/post market) if newer than the regular price.
+        if pts:
+            lt, lp, _ = pts[-1]
+            if m.get("regularMarketTime") and lt > m["regularMarketTime"] + 60 and price:
+                quote["ext_price"] = lp
+                quote["ext_time"] = lt
+        DB_.execute("INSERT OR REPLACE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
+                    [(sym, t, p, v) for t, p, v in pts], many=True)
+        try:
+            r5 = yahoo_chart(sym, "5d", "5m", prepost=True)
+            DB_.execute("INSERT OR IGNORE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
+                        [(sym, t, p, v) for t, p, v in series_points(r5)], many=True)
+        except Exception as e:
+            job_err("stock_5d", e)
+    except Exception as e:
+        # Fallback: Stooq gives a delayed quote only.
+        try:
+            s = stooq_quote(sym)
+            quote.update(s)
+            quote["source"] = "Stooq (delayed)"
+            DB_.execute("INSERT OR REPLACE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
+                        (sym, int(time.time()), s["price"], None))
+            prev_q = STATE.get("quote") or {}
+            quote["prev_close"] = prev_q.get("prev_close")
+        except Exception as e2:
+            raise RuntimeError(f"Yahoo: {e}; Stooq: {e2}")
+    p, pc = quote.get("price"), quote.get("prev_close")
+    if p is not None and pc:
+        quote["change"] = p - pc
+        quote["change_pct"] = (p - pc) / pc * 100
+    if p is not None and CFG.get("ipo_price"):
+        quote["vs_ipo_pct"] = (p - CFG["ipo_price"]) / CFG["ipo_price"] * 100
+    if quote.get("ext_price") and p:
+        quote["ext_change_pct"] = (quote["ext_price"] - p) / p * 100
+    if p is not None and CFG.get("shares_outstanding"):
+        quote["market_cap_est"] = p * CFG["shares_outstanding"]
+    set_state("quote", quote)
+
+
+def collect_daily():
+    sym = CFG["ticker"]
+    r = yahoo_chart(sym, "3mo", "1d")
+    ts = r.get("timestamp") or []
+    q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
+    rows = []
+    for i, t in enumerate(ts):
+        c = (q.get("close") or [None])[i]
+        if c is None:
+            continue
+        day = datetime.fromtimestamp(t, ET_TZ).date().isoformat()
+        rows.append((sym, day, q["open"][i], q["high"][i], q["low"][i], c, q["volume"][i]))
+    DB_.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?,?,?)", rows, many=True)
+
+
+def collect_peers():
+    out = []
+    for s in CFG.get("peers", []):
+        try:
+            m = yahoo_chart(s, "1d", "5m").get("meta", {})
+            p, pc = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+            out.append({"symbol": s, "name": m.get("shortName") or s, "price": p,
+                        "change_pct": ((p - pc) / pc * 100) if (p is not None and pc) else None})
+        except Exception as e:
+            out.append({"symbol": s, "name": s, "price": None, "change_pct": None, "error": str(e)[:120]})
+    set_state("peers", out)
+    if all(x.get("price") is None for x in out) and out:
+        raise RuntimeError(out[0].get("error") or "no peer data")
+
+
+# --------------------------------------------------------------------------- status page
+
+def status_get(path):
+    last = None
+    for base in (CFG["status_base"], CFG.get("status_fallback")):
+        if not base:
+            continue
+        try:
+            return base, fetch_json(base.rstrip("/") + path)
+        except Exception as e:
+            last = e
+    raise last
+
+
+def collect_status():
+    base, j = status_get("/api/v2/summary.json")
+    comps = [{"id": c.get("id"), "name": c.get("name"), "status": c.get("status")}
+             for c in j.get("components", []) if not c.get("group")]
+    incidents = []
+    for i in j.get("incidents", []):
+        ups = i.get("incident_updates") or []
+        incidents.append({
+            "name": i.get("name"), "status": i.get("status"), "impact": i.get("impact"),
+            "url": i.get("shortlink"), "created": iso_to_ts(i.get("created_at")),
+            "updated": iso_to_ts(i.get("updated_at")),
+            "latest": (ups[0].get("body") if ups else "")[:600],
+            "components": [c.get("name") for c in i.get("components", [])],
+        })
+    maint = [{
+        "name": m.get("name"), "status": m.get("status"), "url": m.get("shortlink"),
+        "start": iso_to_ts(m.get("scheduled_for")), "end": iso_to_ts(m.get("scheduled_until")),
+        "components": [c.get("name") for c in m.get("components", [])],
+    } for m in j.get("scheduled_maintenances", [])]
+    st = j.get("status", {})
+    set_state("status", {
+        "indicator": st.get("indicator"), "description": st.get("description"),
+        "page_url": (j.get("page") or {}).get("url") or base,
+        "components": comps, "incidents": incidents, "maintenances": maint,
+    })
+    now = int(time.time())
+    DB_.execute("INSERT INTO status_snap(ts, component, state) VALUES(?,?,?)",
+                [(now, c["name"], c["status"]) for c in comps], many=True)
+
+
+def collect_incidents():
+    _, j = status_get("/api/v2/incidents.json")
+    out = []
+    cutoff = time.time() - 14 * 86400
+    for i in j.get("incidents", []):
+        created = iso_to_ts(i.get("created_at"))
+        if not created or created < cutoff:
+            continue
+        out.append({
+            "name": i.get("name"), "status": i.get("status"), "impact": i.get("impact"),
+            "url": i.get("shortlink"), "created": created,
+            "resolved": iso_to_ts(i.get("resolved_at")),
+            "components": [c.get("name") for c in i.get("components", [])],
+        })
+    set_state("recent_incidents", out)
+    try:
+        _, u = status_get("/api/v2/scheduled-maintenances/upcoming.json")
+        set_state("upcoming_maint", [{
+            "name": m.get("name"), "status": m.get("status"), "url": m.get("shortlink"),
+            "start": iso_to_ts(m.get("scheduled_for")), "end": iso_to_ts(m.get("scheduled_until")),
+            "components": [c.get("name") for c in m.get("components", [])],
+        } for m in u.get("scheduled_maintenances", [])])
+    except Exception as e:
+        job_err("maintenance", e)
+
+
+IMPACT_LEVEL = {"none": 0, "minor": 1, "major": 2, "critical": 3, "maintenance": 0}
+STATE_LEVEL = {"operational": 0, "under_maintenance": 0, "degraded_performance": 1,
+               "partial_outage": 2, "major_outage": 3}
+
+
+def build_timeline(start, end):
+    """Per-component outage intervals from incidents + our own status snapshots."""
+    with STATE_LOCK:
+        comps = [c["name"] for c in (STATE.get("status") or {}).get("components", [])]
+        incidents = list(STATE.get("recent_incidents") or [])
+    rows = {}
+    for name in comps:
+        rows[name] = []
+    for inc in incidents:
+        s = inc["created"]
+        e = inc["resolved"] or int(time.time())
+        if e < start or s > end:
+            continue
+        lvl = IMPACT_LEVEL.get(inc.get("impact") or "minor", 1)
+        for cname in inc.get("components") or ["(unspecified)"]:
+            rows.setdefault(cname, []).append({"start": max(s, start), "end": min(e, end), "level": max(lvl, 1),
+                                               "label": inc["name"], "url": inc.get("url")})
+    snaps = DB_.query("SELECT ts, component, state FROM status_snap WHERE ts>=? ORDER BY ts", (start,))
+    open_iv = {}
+    last_ts = {}
+    for ts, comp, state in snaps:
+        lvl = STATE_LEVEL.get(state, 0)
+        cur = open_iv.get(comp)
+        gap = ts - last_ts.get(comp, ts)
+        if cur and (lvl == 0 or lvl != cur["level"] or gap > 900):
+            cur["end"] = last_ts[comp] if gap > 900 else ts
+            rows.setdefault(comp, []).append(cur)
+            open_iv.pop(comp)
+            cur = None
+        if lvl > 0 and not cur:
+            open_iv[comp] = {"start": ts, "end": ts, "level": lvl, "label": state.replace("_", " "), "src": "snap"}
+        last_ts[comp] = ts
+    for comp, cur in open_iv.items():
+        cur["end"] = last_ts[comp]
+        rows.setdefault(comp, []).append(cur)
+    span = max(1, end - start)
+    out = []
+    for name, ivs in rows.items():
+        ivs.sort(key=lambda x: x["start"])
+        covered, cur_s, cur_e = 0, None, None
+        for iv in ivs:
+            if cur_e is None or iv["start"] > cur_e:
+                if cur_e is not None:
+                    covered += cur_e - cur_s
+                cur_s, cur_e = iv["start"], iv["end"]
+            else:
+                cur_e = max(cur_e, iv["end"])
+        if cur_e is not None:
+            covered += cur_e - cur_s
+        out.append({"component": name, "intervals": ivs, "uptime_pct": round(100 * (1 - covered / span), 2)})
+    # Snapshot coverage tells the page how far back our own sampling goes.
+    first = DB_.query("SELECT MIN(ts) FROM status_snap")[0][0]
+    return {"rows": out, "sampled_since": first}
+
+
+# --------------------------------------------------------------------------- model probes
+
+PROBE_PROMPT = "Count from 1 to 60. Reply with only the numbers separated by single spaces."
+
+
+def probe_model(model, key):
+    body = json.dumps({"model": model, "max_tokens": 120, "stream": True,
+                       "messages": [{"role": "user", "content": PROBE_PROMPT}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST", headers={
+        "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json",
+        "user-agent": UA})
+    t0 = time.monotonic()
+    ttft = None
+    out_tokens = None
+    headers = {}
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            headers = {k.lower(): v for k, v in r.headers.items()}
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                typ = ev.get("type")
+                if typ == "content_block_delta" and ttft is None:
+                    ttft = time.monotonic() - t0
+                elif typ == "message_delta":
+                    out_tokens = (ev.get("usage") or {}).get("output_tokens", out_tokens)
+                elif typ == "error":
+                    raise RuntimeError((ev.get("error") or {}).get("message", "stream error"))
+        total = time.monotonic() - t0
+        tps = None
+        if out_tokens and ttft is not None and total - ttft > 0.05:
+            tps = max(0.0, (out_tokens - 1) / (total - ttft))
+        return {"ok": True, "ttft": ttft, "total": total, "out_tokens": out_tokens, "tps": tps,
+                "error": None, "headers": headers}
+    except urllib.error.HTTPError as e:
+        headers = {k.lower(): v for k, v in e.headers.items()}
+        try:
+            msg = json.loads(e.read().decode()).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        return {"ok": False, "ttft": None, "total": time.monotonic() - t0, "out_tokens": None, "tps": None,
+                "error": f"HTTP {e.code} {msg}"[:200], "headers": headers, "code": e.code}
+    except Exception as e:
+        return {"ok": False, "ttft": None, "total": time.monotonic() - t0, "out_tokens": None, "tps": None,
+                "error": str(e)[:200], "headers": headers}
+
+
+def parse_rate_limits(h):
+    if not h:
+        return None
+    out = {}
+    for k, v in h.items():
+        if k.startswith("anthropic-ratelimit-"):
+            out[k[len("anthropic-ratelimit-"):]] = v
+        elif k == "retry-after":
+            out["retry-after"] = v
+    return out or None
+
+
+def collect_probes():
+    key = CFG.get("anthropic_api_key")
+    if not key:
+        job_ok("probes", "no API key - probes off")
+        return
+    models = CFG.get("probe_models") or []
+    errors = []
+    for m in models:
+        r = probe_model(m, key)
+        DB_.execute("INSERT INTO probe(ts, model, ok, ttft, total, out_tokens, tps, error) VALUES(?,?,?,?,?,?,?,?)",
+                    (int(time.time()), m, 1 if r["ok"] else 0, r["ttft"], r["total"], r["out_tokens"], r["tps"],
+                     r["error"]))
+        rl = parse_rate_limits(r.get("headers"))
+        if rl:
+            set_state("rate_limits", {"at": int(time.time()), "model": m, "limits": rl})
+        if not r["ok"]:
+            errors.append(f"{m}: {r['error']}")
+        time.sleep(2)
+    if errors and len(errors) == len(models):
+        raise RuntimeError("; ".join(errors)[:300])
+
+
+def collect_models():
+    key = CFG.get("anthropic_api_key")
+    if not key:
+        job_ok("models", "no API key")
+        return
+    j = fetch_json("https://api.anthropic.com/v1/models?limit=100",
+                   headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+    data = j.get("data", [])
+    seen = DB_.kv_get("seen_models")
+    now = int(time.time())
+    baseline = seen is None
+    seen = seen or {}
+    for m in data:
+        if m["id"] not in seen:
+            seen[m["id"]] = {"first_seen": now, "baseline": baseline}
+    DB_.kv_set("seen_models", seen)
+    out = []
+    for m in data:
+        s = seen.get(m["id"], {})
+        out.append({"id": m["id"], "display_name": m.get("display_name") or m["id"],
+                    "created": iso_to_ts(m.get("created_at")),
+                    "first_seen": s.get("first_seen"),
+                    "new": (not s.get("baseline")) and now - s.get("first_seen", 0) < 14 * 86400})
+    out.sort(key=lambda x: x.get("created") or 0, reverse=True)
+    set_state("available_models", out)
+
+
+def probe_summary():
+    since = int(time.time()) - 4 * 86400
+    rows = DB_.query("SELECT ts, model, ok, ttft, total, out_tokens, tps, error FROM probe WHERE ts>=? ORDER BY ts",
+                     (since,))
+    by = {}
+    for ts, model, ok, ttft, total, out_tokens, tps, err in rows:
+        by.setdefault(model, []).append((ts, ok, ttft, tps, total, err))
+    names = {m["id"]: m["display_name"] for m in STATE.get("available_models") or []}
+    out = []
+    for model in (CFG.get("probe_models") or []):
+        pts = by.get(model, [])
+        good = [p for p in pts if p[1] and p[2] is not None]
+        last = pts[-1] if pts else None
+        med_ttft = statistics.median([p[2] for p in good]) if len(good) >= 3 else None
+        med_tps = statistics.median([p[3] for p in good if p[3]]) if len([p for p in good if p[3]]) >= 3 else None
+        recent = [p for p in good if p[0] >= time.time() - 3600]
+        load = None
+        if last and last[1] and med_ttft and med_tps and last[3]:
+            ratio = ((last[2] / med_ttft) + (med_tps / last[3])) / 2
+            if ratio < 0.85:
+                label, level = "Faster than usual", 0
+            elif ratio < 1.2:
+                label, level = "Normal", 1
+            elif ratio < 1.6:
+                label, level = "Busy", 2
+            else:
+                label, level = "Very busy", 3
+            load = {"label": label, "level": level, "ratio": round(ratio, 2)}
+        elif last and not last[1]:
+            load = {"label": "Failing", "level": 3, "ratio": None}
+        ok_rate = (sum(1 for p in pts if p[1]) / len(pts) * 100) if pts else None
+        out.append({
+            "model": model, "display_name": names.get(model, model),
+            "at": last[0] if last else None, "ok": bool(last[1]) if last else None,
+            "ttft": last[2] if last else None, "tps": last[3] if last else None,
+            "total": last[4] if last else None, "error": last[5] if last else None,
+            "med_ttft": med_ttft, "med_tps": med_tps, "samples": len(pts),
+            "success_pct": ok_rate, "load": load,
+            "recent_tps": statistics.mean([p[3] for p in recent if p[3]]) if any(p[3] for p in recent) else None,
+        })
+    return out
+
+
+def hourly_profile():
+    """Average time-to-first-token by hour of day (ET) across all stored probes."""
+    rows = DB_.query("SELECT ts, ttft FROM probe WHERE ok=1 AND ttft IS NOT NULL AND ts>=?",
+                     (int(time.time()) - 30 * 86400,))
+    buckets = {}
+    for ts, ttft in rows:
+        h = datetime.fromtimestamp(ts, ET_TZ).hour
+        buckets.setdefault(h, []).append(ttft)
+    return [{"hour": h, "avg_ttft": statistics.mean(buckets[h]) if h in buckets else None,
+             "n": len(buckets.get(h, []))} for h in range(24)]
+
+
+# --------------------------------------------------------------------------- news
+
+RE_RELEASE = re.compile(r"\b(launch\w*|releas\w*|unveil\w*|introduc\w*|debut\w*|rolls? out|new model|announc\w*|now available)\b", re.I)
+RE_PRODUCT = re.compile(r"\b(claude|opus|sonnet|haiku|mythos|fable|claude code)\b", re.I)
+RE_STOCK = re.compile(r"\b(stock|shares|IPO|nasdaq|ANT|valuation|investors?|analysts?)\b")
+RE_OUTAGE = re.compile(r"\b(outage|down|disruption|errors?|degraded)\b", re.I)
+
+
+def collect_news():
+    items = {}
+    for q in CFG.get("news_queries", []):
+        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+            {"q": q + " when:7d", "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        try:
+            _, _, b = fetch(url)
+        except Exception as e:
+            job_err("news:" + q, e)
+            continue
+        root = ET.fromstring(b)
+        for it in root.iter("item"):
+            title = (it.findtext("title") or "").strip()
+            src_el = it.find("source")
+            source = (src_el.text or "").strip() if src_el is not None else ""
+            if source and title.endswith(" - " + source):
+                title = title[: -len(" - " + source)]
+            link = (it.findtext("link") or "").strip()
+            try:
+                ts = int(parsedate_to_datetime(it.findtext("pubDate")).timestamp())
+            except Exception:
+                ts = 0
+            key = re.sub(r"\W+", "", title.lower())[:80]
+            if not key or key in items:
+                continue
+            tags = []
+            if RE_RELEASE.search(title) and RE_PRODUCT.search(title):
+                tags.append("release")
+            if RE_STOCK.search(title):
+                tags.append("stock")
+            if RE_OUTAGE.search(title) and RE_PRODUCT.search(title):
+                tags.append("outage")
+            items[key] = {"title": title, "source": source, "url": link, "ts": ts, "tags": tags}
+    if not items:
+        raise RuntimeError("no headlines fetched")
+    news = sorted(items.values(), key=lambda x: x["ts"], reverse=True)[:60]
+    set_state("news", news)
+
+
+# --------------------------------------------------------------------------- usage (manual)
+
+def usage_view():
+    u = DB_.kv_get("usage", {}) or {}
+    now = int(time.time())
+    out = dict(u)
+    sr = u.get("session_reset")
+    if sr and sr <= now:
+        out["session_pct"] = 0
+        out["session_note"] = "Window reset. A new 5-hour window starts with your next message."
+        out["session_reset"] = None
+    wr = u.get("weekly_reset")
+    if wr and wr <= now:
+        while wr <= now:
+            wr += 7 * 86400
+        out["weekly_reset"] = wr
+        out["weekly_pct"] = 0
+        out["weekly_note"] = "Weekly limit reset (next reset estimated 7 days later)."
+    return out
+
+
+def save_usage(payload):
+    allowed = {"plan", "session_pct", "session_reset", "weekly_pct", "weekly_reset", "weekly_model_pct",
+               "weekly_model_label"}
+    u = {k: payload.get(k) for k in allowed if k in payload}
+    for k in ("session_pct", "weekly_pct", "weekly_model_pct"):
+        if u.get(k) not in (None, ""):
+            u[k] = max(0.0, min(100.0, float(u[k])))
+        else:
+            u[k] = None
+    for k in ("session_reset", "weekly_reset"):
+        if u.get(k) not in (None, ""):
+            u[k] = int(u[k])
+        else:
+            u[k] = None
+    for k in ("plan", "weekly_model_label"):
+        if u.get(k) is not None:
+            u[k] = str(u[k])[:40]
+    u["updated"] = int(time.time())
+    DB_.kv_set("usage", u)
+    return usage_view()
+
+
+# --------------------------------------------------------------------------- scheduler
+
+KICK = threading.Event()
+
+
+def stock_interval():
+    return {"open": 60, "pre": 120, "post": 120}.get(market_state(), 900)
+
+
+JOBS = [
+    ("stock", collect_stock, stock_interval),
+    ("daily", collect_daily, lambda: 1800),
+    ("peers", collect_peers, lambda: 300 if market_state() == "open" else 1800),
+    ("status", collect_status, lambda: 120),
+    ("incidents", collect_incidents, lambda: 600),
+    ("models", collect_models, lambda: 3600),
+    ("probes", collect_probes, lambda: max(5, int(CFG.get("probe_interval_min", 15))) * 60),
+    ("news", collect_news, lambda: 1200),
+    ("prune", lambda: prune(), lambda: 86400),
+]
+
+
+def prune():
+    cutoff = int(time.time()) - int(CFG.get("history_keep_days", 45)) * 86400
+    for t in ("stock", "status_snap", "probe"):
+        DB_.execute(f"DELETE FROM {t} WHERE ts<?", (cutoff,))
+
+
+def scheduler():
+    next_run = {name: 0 for name, _, _ in JOBS}
+    running = set()
+    lock = threading.Lock()
+
+    def run(name, fn):
+        try:
+            fn()
+            if name not in ("probes", "models") or CFG.get("anthropic_api_key"):
+                job_ok(name)
+        except Exception as e:
+            job_err(name, e)
+            if os.environ.get("CLAUDE_PULSE_DEBUG"):
+                traceback.print_exc()
+        finally:
+            with lock:
+                running.discard(name)
+
+    while True:
+        now = time.time()
+        for name, fn, interval in JOBS:
+            with lock:
+                busy = name in running
+            if not busy and now >= next_run[name]:
+                next_run[name] = now + interval()
+                with lock:
+                    running.add(name)
+                threading.Thread(target=run, args=(name, fn), daemon=True, name=name).start()
+        if KICK.wait(5):
+            KICK.clear()
+            for name in ("stock", "peers", "status", "incidents", "news"):
+                next_run[name] = 0
+
+
+# --------------------------------------------------------------------------- API
+
+def api_state():
+    with STATE_LOCK:
+        s = json.loads(json.dumps(STATE))
+    ms = market_state()
+    return {
+        "version": VERSION,
+        "now": int(time.time()),
+        "market": {"state": ms, "next_open": next_market_open() if ms != "open" else None},
+        "config": {"ticker": CFG["ticker"], "ipo_price": CFG["ipo_price"], "ipo_date": CFG.get("ipo_date"),
+                   "has_key": bool(CFG.get("anthropic_api_key")), "probe_interval_min": CFG.get("probe_interval_min"),
+                   "offline": bool(CFG.get("offline"))},
+        "quote": s["quote"],
+        "peers": s["peers"],
+        "status": s["status"],
+        "recent_incidents": s["recent_incidents"],
+        "upcoming_maint": s["upcoming_maint"],
+        "probes": probe_summary(),
+        "rate_limits": s["rate_limits"],
+        "available_models": s["available_models"],
+        "news": s["news"],
+        "usage": usage_view(),
+        "jobs": s["jobs"],
+    }
+
+
+def api_history(days):
+    days = max(1, min(30, days))
+    end = int(time.time())
+    start = end - days * 86400
+    sym = CFG["ticker"]
+    # Stock goes back further so the page can show the last N *trading* days.
+    stock = DB_.query("SELECT ts, price, volume FROM stock WHERE symbol=? AND ts>=? ORDER BY ts",
+                      (sym, end - max(days, 10) * 86400))
+    daily = DB_.query("SELECT day, open, high, low, close, volume FROM daily WHERE symbol=? ORDER BY day", (sym,))
+    probes = {}
+    for ts, model, ok, ttft, tps in DB_.query(
+            "SELECT ts, model, ok, ttft, tps FROM probe WHERE ts>=? ORDER BY ts", (start,)):
+        probes.setdefault(model, []).append([ts, ok, ttft, tps])
+    return {
+        "start": start, "end": end,
+        "stock": [[t, p, v] for t, p, v in stock],
+        "daily": [list(r) for r in daily],
+        "probes": probes,
+        "timeline": build_timeline(start, end),
+        "hourly": hourly_profile(),
+    }
+
+
+LAST_REFRESH = [0.0]
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ClaudePulse/" + VERSION
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("CLAUDE_PULSE_DEBUG"):
+            super().log_message(fmt, *args)
+
+    def send_json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_file(self, path, ctype):
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except FileNotFoundError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            if u.path in ("/", "/index.html"):
+                return self.send_file(os.path.join(STATIC_DIR, "index.html"), "text/html; charset=utf-8")
+            if u.path == "/icon.svg":
+                return self.send_file(os.path.join(STATIC_DIR, "icon.svg"), "image/svg+xml")
+            if u.path == "/api/state":
+                return self.send_json(api_state())
+            if u.path == "/api/history":
+                q = urllib.parse.parse_qs(u.query)
+                return self.send_json(api_history(int((q.get("days") or ["4"])[0])))
+            if u.path == "/api/health":
+                return self.send_json({"ok": True, "version": VERSION})
+            self.send_error(404)
+        except Exception as e:
+            traceback.print_exc()
+            self.send_json({"error": str(e)}, 500)
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 10000:
+                return self.send_json({"error": "too large"}, 413)
+            payload = json.loads(self.rfile.read(n) or b"{}")
+            if u.path == "/api/usage":
+                return self.send_json(save_usage(payload))
+            if u.path == "/api/refresh":
+                if time.time() - LAST_REFRESH[0] > 20:
+                    LAST_REFRESH[0] = time.time()
+                    KICK.set()
+                    return self.send_json({"ok": True})
+                return self.send_json({"ok": False, "error": "Refreshed moments ago, try again shortly."})
+            self.send_error(404)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 400)
+
+
+def main():
+    threading.Thread(target=scheduler, daemon=True, name="scheduler").start()
+    srv = ThreadingHTTPServer((CFG["bind"], int(CFG["port"])), Handler)
+    print(f"Claude Pulse {VERSION} on http://{CFG['bind']}:{CFG['port']}  (data: {DATA_DIR})", flush=True)
+    if not CFG.get("anthropic_api_key"):
+        print("No Anthropic API key set: model speed probes are off.", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
