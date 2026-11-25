@@ -12,7 +12,7 @@ A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5 (or any
 - **Service status.** Each component on status.claude.com, live incident updates, and scheduled maintenance with countdowns.
 - **Incident timeline.** A 4-day outage bar and uptime % for each component, built from incident reports plus the Pi's own checks every 2 minutes.
 - **Model speed and load.** Live from OpenRouter's real traffic to each Claude model: uptime with no key, plus time to first token and tokens per second with a free OpenRouter key. Each model is compared with its usual speed and labeled Faster than usual, Normal, Busy or Very busy. Includes 4-day charts and a "busiest hours" heatmap.
-- **Your usage and resets.** Countdowns for your 5-hour session and weekly limits, plus your API rate-limit headroom.
+- **Your usage and resets.** Live 5-hour session and weekly usage with reset countdowns and a 4-day chart, read automatically through Claude Code's sign-in on the Pi. API rate-limit headroom appears too if you add an Anthropic API key.
 - **Release radar.** Checks the Claude model list every hour (OpenRouter's public list, or Anthropic's with a key) and flags any new model, plus headlines about releases.
 - **News.** Headlines from the last week, filterable by Releases, Stock and Outages.
 
@@ -63,14 +63,18 @@ An Anthropic key (console.anthropic.com) adds:
 
 Put it in the config as `"anthropic_api_key"`. The probes send each model a tiny request every `probe_interval_min` minutes (default 15), about a cent a day. The speed table uses OpenRouter's numbers when it has them, and your probes otherwise.
 
-## Why plan usage is typed in
+## Your plan usage (automatic, through Claude Code)
 
-Claude doesn't offer an API for claude.ai plan usage. To fill it in:
+Claude has no official API for plan usage. Claude Pulse reads it the way Claude Code does:
 
-1. Open **Settings → Usage** in Claude.
-2. Press **Update** on the dashboard and type in the percentages and reset times.
+1. Install Claude Code on the Pi: `curl -fsSL https://claude.ai/install.sh | bash`
+2. Run `claude` once and sign in with your Claude account.
 
-The countdowns then run on their own. When the weekly reset passes, it rolls forward 7 days automatically. When the 5-hour session reset passes, the session shows as reset.
+That's all. Every 5 minutes the dashboard reads the sign-in Claude Code saved in `~/.claude/.credentials.json` and fetches your session and weekly usage, with reset times. The token stays on the Pi: it's only sent to Anthropic, never to the web page.
+
+- This uses an **undocumented** endpoint, so Anthropic could change it at any time. If it stops working, the card falls back to typing the numbers in by hand (**Update** button, numbers from Claude → Settings → Usage).
+- If the card says the sign-in has **expired**, run `claude` once in a terminal on the Pi to refresh it.
+- To turn this off, set `"claude_usage_auto": false` in the config.
 
 ## Handy commands
 

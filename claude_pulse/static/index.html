@@ -168,8 +168,15 @@ footer{grid-column:span 12;color:var(--dim);font-size:12px;text-align:center;pad
       <div class="full"><span class="muted" style="margin-right:auto;font-size:12px">Copy these from Claude → Settings → Usage.</span>
         <button type="button" id="usageCancel">Cancel</button><button class="primary" type="submit">Save</button></div>
     </form>
-    <h2 style="margin-top:16px">API rate limits <span class="right muted" id="rlAt"></span></h2>
-    <div id="rateLimits"></div>
+    <div id="usageChartWrap" style="display:none">
+      <h2 style="margin-top:16px">Usage · last 4 days <span class="right muted">% used</span></h2>
+      <div class="chart" id="usageChart"></div>
+      <div class="legend" id="usageLegend"></div>
+    </div>
+    <div id="rlWrap">
+      <h2 style="margin-top:16px">API rate limits <span class="right muted" id="rlAt"></span></h2>
+      <div id="rateLimits"></div>
+    </div>
   </section>
 
   <!-- INCIDENT TIMELINE -->
@@ -476,29 +483,64 @@ function renderProbeCharts() {
 }
 
 // ---------- usage
-function renderUsage() {
-  const u = S.usage || {};
-  const rows = [];
-  const bar = (label, pct, reset, note) => `<div class="usage-row"><div class="top"><b>${esc(label)}</b><span>${pct == null ? "—" : Math.round(pct) + "% used"}</span></div>
-    <div class="bar"><div class="${pct >= 80 ? "hot" : ""}" style="width:${pct || 0}%"></div></div>
+function usageBar(label, pct, reset, note) {
+  return `<div class="usage-row"><div class="top"><b>${esc(label)}</b><span>${pct == null ? "—" : Math.round(pct) + "% used"}</span></div>
+    <div class="bar"><div class="${pct >= 80 ? "hot" : ""}" style="width:${Math.min(100, pct || 0)}%"></div></div>
     <div class="top muted" style="font-size:12px"><span>${note ? esc(note) : reset ? "Resets " + esc(fmtTime(reset)) : "Reset time not set"}</span>${reset ? `<span class="cd" data-cd="${reset}"></span>` : ""}</div></div>`;
-  if (!u.updated) {
-    $("#usageView").innerHTML = `<div class="note" style="margin-top:0">Claude doesn't publish your plan usage to apps, so copy it from <b>Settings → Usage</b> in Claude and press <b>Update</b>. The countdowns then run here, and the weekly reset rolls forward automatically.</div>`;
+}
+function renderUsage() {
+  const u = S.usage || {}, pu = S.plan_usage || {};
+  const live = pu.status === "ok" || ((pu.status === "expired" || pu.status === "error") && pu.meters?.length);
+  let h = "";
+  if (pu.status === "expired")
+    h += `<div class="warnbox">Claude Code's sign-in on this Pi has expired, so usage can't be read right now${pu.last_ok ? " (last reading " + esc(ago(pu.last_ok)) + ")" : ""}. Open a terminal on the Pi and run <code>claude</code> once. It refreshes the sign-in, and this updates within 5 minutes.</div>`;
+  else if (pu.status === "error")
+    h += `<div class="errbox">Couldn't read usage from Anthropic (${esc(S.jobs.plan_usage?.err || "HTTP " + pu.code)}). Showing the last reading.</div>`;
+  if (live) {
+    const plan = pu.plan ? pu.plan.charAt(0).toUpperCase() + pu.plan.slice(1) + " plan · " : "";
+    h += `<div class="muted" style="font-size:12px;margin-bottom:8px">${esc(plan)}live from your Claude Code sign-in · ${esc(ago(pu.last_ok || pu.at))}</div>`;
+    h += pu.meters.map(m => usageBar(m.label, m.pct, m.resets && m.resets > S.now ? m.resets : null, m.resets && m.resets <= S.now ? "Reset — refreshing…" : null)).join("");
+    $("#btnUsage").style.display = "none"; $("#usageForm").classList.remove("open");
   } else {
-    rows.push(bar("Current session (5-hour window)", u.session_pct, u.session_reset, u.session_note));
-    rows.push(bar("Weekly — all models", u.weekly_pct, u.weekly_reset, u.weekly_note));
-    if (u.weekly_model_pct != null) rows.push(bar("Weekly — model-specific limit", u.weekly_model_pct, u.weekly_reset, null));
-    $("#usageView").innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:8px">${esc(u.plan || "")} plan · entered ${esc(ago(u.updated))}</div>` + rows.join("");
+    $("#btnUsage").style.display = "";
+    if (pu.status === "no_claude_code")
+      h += `<div class="note" style="margin-top:0">To fill this in automatically, install Claude Code on this Pi and sign in once with your Claude account:<br><code>curl -fsSL https://claude.ai/install.sh | bash</code> then run <code>claude</code>. This checks for it every 5 minutes. Until then you can type the numbers in with <b>Update</b>.</div>`;
+    if (!u.updated) {
+      if (pu.status !== "no_claude_code") h += `<div class="note" style="margin-top:0">Copy your usage from <b>Settings → Usage</b> in Claude and press <b>Update</b>. The countdowns then run here.</div>`;
+    } else {
+      h += `<div class="muted" style="font-size:12px;margin:8px 0">${esc(u.plan || "")} plan · typed in ${esc(ago(u.updated))}</div>`;
+      h += usageBar("Current session (5-hour window)", u.session_pct, u.session_reset, u.session_note);
+      h += usageBar("Weekly — all models", u.weekly_pct, u.weekly_reset, u.weekly_note);
+      if (u.weekly_model_pct != null) h += usageBar("Weekly — model-specific limit", u.weekly_model_pct, u.weekly_reset, null);
+    }
   }
-  // API rate limits
+  $("#usageView").innerHTML = h;
+  // API rate limits: only relevant with an Anthropic API key.
+  $("#rlWrap").style.display = S.config.has_key ? "" : "none";
   const rl = S.rate_limits;
-  if (!rl) { $("#rateLimits").innerHTML = `<div class="dim" style="font-size:13px">${S.config.has_key ? "Shows after the first probe." : "Needs an API key (these are API limits, separate from your Claude app plan)."}</div>`; $("#rlAt").textContent = ""; return; }
+  if (!S.config.has_key) return;
+  if (!rl) { $("#rateLimits").innerHTML = `<div class="dim" style="font-size:13px">Shows after the first probe.</div>`; $("#rlAt").textContent = ""; return; }
   $("#rlAt").textContent = "from probe " + ago(rl.at);
   const L = rl.limits; const groups = [["requests", "Requests / min"], ["input-tokens", "Input tokens / min"], ["output-tokens", "Output tokens / min"], ["tokens", "Tokens / min"]];
   $("#rateLimits").innerHTML = groups.filter(([g]) => L[g + "-limit"]).map(([g, label]) => {
     const lim = +L[g + "-limit"], rem = +L[g + "-remaining"], used = lim ? (1 - rem / lim) * 100 : 0;
     return `<div class="usage-row"><div class="top"><b>${esc(label)}</b><span>${esc(rem.toLocaleString())} / ${esc(lim.toLocaleString())} left</span></div><div class="bar"><div style="width:${used}%"></div></div></div>`;
   }).join("") || `<div class="dim">No rate-limit headers returned.</div>`;
+}
+function renderUsageChart() {
+  if (!H || !S) return;
+  const uh = H.usage_hist || {}; const keys = Object.keys(uh);
+  const names = Object.fromEntries((S.plan_usage?.meters || []).map(m => [m.key, m.label]));
+  $("#usageChartWrap").style.display = keys.length ? "" : "none";
+  if (!keys.length) return;
+  const start = H.end - 4 * 86400;
+  const ticks = []; for (let t = start; t <= H.end; t += 3600) { const d = new Date(t * 1000); if (d.getHours() === 0) { d.setMinutes(0, 0, 0); ticks.push([d.getTime() / 1000, d.toLocaleDateString(undefined, {weekday: "short", month: "numeric", day: "numeric"})]); } }
+  const order = k => k === "five_hour" ? 0 : k === "seven_day" ? 1 : 2;
+  keys.sort((a, b) => order(a) - order(b));
+  const cols = ["#e07a52", "#6aa7e8", "#b48ef0", "#4cc3bd", "#e6b84f"];
+  const series = keys.map((k, i) => ({name: names[k] || k, color: cols[i % cols.length], noDots: true, points: uh[k]}));
+  lineChart($("#usageChart"), series, {height: 160, xMin: start, xMax: H.end, xTicks: ticks, yZero: true, yFmt: v => v.toFixed(0) + "%", tipFmt: v => v.toFixed(0) + "%", gap: 3600, maxSnap: 3600});
+  $("#usageLegend").innerHTML = series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("");
 }
 function openUsageForm() {
   const f = $("#usageForm"), u = S.usage || {};
@@ -544,7 +586,7 @@ function renderFooter() {
     + (bad.length ? `<div style="margin-top:6px;color:#c98a7f">Problems: ${bad.map(([k, j]) => esc(k) + " (" + esc(j.err) + ")").join(" · ")}</div>` : "");
 }
 
-function renderHistory() { renderStockChart(); renderTimeline(); renderProbeCharts(); }
+function renderHistory() { renderStockChart(); renderTimeline(); renderProbeCharts(); renderUsageChart(); }
 function tick() { document.querySelectorAll("[data-cd]").forEach(el => el.textContent = countdown(+el.dataset.cd)); }
 
 

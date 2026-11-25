@@ -38,7 +38,7 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
 CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
 ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "CharlesPhillips3/claude-pulse"
 REPO_BRANCH = "main"
 
@@ -53,6 +53,8 @@ DEFAULT_CONFIG = {
     "anthropic_api_key": "",
     "openrouter_api_key": "",
     "openrouter_models": [],
+    "claude_usage_auto": True,
+    "claude_credentials_path": "",
     "probe_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"],
     "probe_interval_min": 15,
     "status_base": "https://status.claude.com",
@@ -122,6 +124,8 @@ class DB:
             CREATE TABLE IF NOT EXISTS orstat (ts INTEGER, model TEXT, provider TEXT, ttft REAL, tps REAL,
                 up5 REAL, up30 REAL, up1d REAL);
             CREATE INDEX IF NOT EXISTS orstat_ts ON orstat(ts);
+            CREATE TABLE IF NOT EXISTS usage_hist (ts INTEGER, meter TEXT, pct REAL);
+            CREATE INDEX IF NOT EXISTS usage_hist_ts ON usage_hist(ts);
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
             """)
             c.commit()
@@ -164,6 +168,7 @@ STATE = {
     "or_models": [],
     "or_watch": [],
     "or_detail": {},
+    "plan_usage": None,
     "news": [],
     "jobs": {},
 }
@@ -974,6 +979,86 @@ def or_summary():
     return out
 
 
+# --------------------------------------------------------------------------- Claude plan usage (via Claude Code's sign-in)
+# Unofficial: reads the OAuth token Claude Code saved on this machine and asks the same
+# internal endpoint Claude Code uses. The token never leaves this server process.
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+METER_NAMES = {
+    "five_hour": "Current session (5-hour)",
+    "seven_day": "Weekly · all models",
+    "seven_day_opus": "Weekly · Opus",
+    "seven_day_sonnet": "Weekly · Sonnet",
+    "seven_day_omelette": "Weekly · Claude Design",
+    "seven_day_oauth_apps": "Weekly · connected apps",
+}
+
+
+def claude_cred_paths():
+    paths = []
+    if CFG.get("claude_credentials_path"):
+        paths.append(os.path.expanduser(CFG["claude_credentials_path"]))
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        paths.append(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".credentials.json"))
+    paths.append(os.path.expanduser("~/.claude/.credentials.json"))
+    return paths
+
+
+def read_claude_token():
+    for p in claude_cred_paths():
+        try:
+            with open(p) as f:
+                o = (json.load(f) or {}).get("claudeAiOauth") or {}
+        except (FileNotFoundError, PermissionError, ValueError):
+            continue
+        if o.get("accessToken"):
+            return {"token": o["accessToken"], "expires": (o.get("expiresAt") or 0) / 1000 or None,
+                    "plan": o.get("subscriptionType"), "path": p}
+    return None
+
+
+def meter_label(key):
+    if key in METER_NAMES:
+        return METER_NAMES[key]
+    return key.replace("seven_day_", "Weekly · ").replace("_", " ")
+
+
+def collect_plan_usage():
+    if not CFG.get("claude_usage_auto", True):
+        set_state("plan_usage", {"status": "off"})
+        return
+    cred = read_claude_token()
+    now = int(time.time())
+    if not cred:
+        set_state("plan_usage", {"status": "no_claude_code", "at": now})
+        return
+    prev = STATE.get("plan_usage") or {}
+    try:
+        j = fetch_json(USAGE_URL, headers={"Authorization": "Bearer " + cred["token"],
+                                           "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json"})
+    except urllib.error.HTTPError as e:
+        status = "expired" if e.code in (401, 403) else "error"
+        set_state("plan_usage", {"status": status, "at": now, "code": e.code, "plan": cred.get("plan"),
+                                 "token_expires": cred.get("expires"),
+                                 "last_ok": prev.get("last_ok"), "meters": prev.get("meters")})
+        if status == "error":
+            raise RuntimeError(f"usage endpoint HTTP {e.code}")
+        return
+    meters = []
+    for k, v in (j or {}).items():
+        if isinstance(v, dict) and v.get("utilization") is not None:
+            meters.append({"key": k, "label": meter_label(k), "pct": max(0.0, min(100.0, float(v["utilization"]))),
+                           "resets": iso_to_ts(v.get("resets_at"))})
+    order = {"five_hour": 0, "seven_day": 1}
+    meters.sort(key=lambda m: (order.get(m["key"], 2), m["key"]))
+    if not meters:
+        raise RuntimeError("usage endpoint returned no meters")
+    DB_.execute("INSERT INTO usage_hist(ts, meter, pct) VALUES(?,?,?)",
+                [(now, m["key"], m["pct"]) for m in meters], many=True)
+    set_state("plan_usage", {"status": "ok", "at": now, "last_ok": now, "plan": cred.get("plan"),
+                             "token_expires": cred.get("expires"), "meters": meters})
+
+
 # --------------------------------------------------------------------------- news
 
 RE_RELEASE = re.compile(r"\b(launch\w*|releas\w*|unveil\w*|introduc\w*|debut\w*|rolls? out|new model|announc\w*|now available)\b", re.I)
@@ -1154,6 +1239,7 @@ JOBS = [
     ("openrouter", collect_or_stats, lambda: 300),
     ("probes", collect_probes, lambda: max(5, int(CFG.get("probe_interval_min", 15))) * 60),
     ("news", collect_news, lambda: 1200),
+    ("plan_usage", collect_plan_usage, lambda: 300),
     ("update_check", check_update, lambda: 6 * 3600),
     ("prune", lambda: prune(), lambda: 86400),
 ]
@@ -1161,7 +1247,7 @@ JOBS = [
 
 def prune():
     cutoff = int(time.time()) - int(CFG.get("history_keep_days", 45)) * 86400
-    for t in ("stock", "status_snap", "probe", "orstat"):
+    for t in ("stock", "status_snap", "probe", "orstat", "usage_hist"):
         DB_.execute(f"DELETE FROM {t} WHERE ts<?", (cutoff,))
 
 
@@ -1195,7 +1281,7 @@ def scheduler():
                 threading.Thread(target=run, args=(name, fn), daemon=True, name=name).start()
         if KICK.wait(5):
             KICK.clear()
-            for name in ("stock", "peers", "status", "incidents", "news"):
+            for name in ("stock", "peers", "status", "incidents", "news", "plan_usage"):
                 next_run[name] = 0
 
 
@@ -1226,9 +1312,17 @@ def api_state():
         "models_source": "Anthropic API" if s["available_models"] else ("OpenRouter" if s["or_models"] else None),
         "news": s["news"],
         "usage": usage_view(),
+        "plan_usage": s.get("plan_usage"),
         "jobs": s["jobs"],
         "update": s.get("update"),
     }
+
+
+def usage_hist(start):
+    out = {}
+    for ts, meter, pct in DB_.query("SELECT ts, meter, pct FROM usage_hist WHERE ts>=? ORDER BY ts", (start,)):
+        out.setdefault(meter, []).append([ts, pct])
+    return out
 
 
 def api_history(days):
@@ -1250,6 +1344,7 @@ def api_history(days):
         "daily": [list(r) for r in daily],
         "probes": probes,
         "orstats": {m: [list(p) for p in pts] for m, pts in or_series(start).items()},
+        "usage_hist": usage_hist(start),
         "timeline": build_timeline(start, end),
         "hourly": hourly_profile(),
     }
