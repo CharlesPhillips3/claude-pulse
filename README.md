@@ -13,6 +13,7 @@ A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5 (or any
 - **Incident timeline.** A 4-day outage bar and uptime % for each component, built from incident reports plus the Pi's own checks every 2 minutes.
 - **Model speed and load.** Live from OpenRouter's real traffic to each Claude model: uptime with no key, plus time to first token and tokens per second with a free OpenRouter key. Each model is compared with its usual speed and labeled Faster than usual, Normal, Busy or Very busy. Includes 4-day charts and a "busiest hours" heatmap.
 - **Your usage and resets.** Live 5-hour session and weekly usage with reset countdowns and a 4-day chart, read automatically through Claude Code's sign-in on the Pi. API rate-limit headroom appears too if you add an Anthropic API key.
+- **Best time to use Claude.** Shows whether it's peak or off-peak right now with a countdown, a week grid (Eastern time) of Anthropic's peak window combined with the speed this Pi has measured, and the quickest off-peak windows in the next 48 hours.
 - **Release radar.** Checks the Claude model list every hour (OpenRouter's public list, or Anthropic's with a key) and flags any new model, plus headlines about releases.
 - **News.** Headlines from the last week, filterable by Releases, Stock and Outages.
 
@@ -75,6 +76,16 @@ That's all. Every 5 minutes the dashboard reads the sign-in Claude Code saved in
 - This uses an **undocumented** endpoint, so Anthropic could change it at any time. If it stops working, the card falls back to typing the numbers in by hand (**Update** button, numbers from Claude → Settings → Usage).
 - If the card says the sign-in has **expired**, run `claude` once in a terminal on the Pi to refresh it.
 - To turn this off, set `"claude_usage_auto": false` in the config.
+
+## Peak hours
+
+Anthropic's announced peak window is weekdays 5–11 AM Pacific (8 AM–2 PM Eastern). During it, your 5-hour session drains faster; off-peak it lasts longer. Weekly limits are the same at any hour. If Anthropic changes the window, edit `peak_hours` in the config:
+
+```json
+"peak_hours": {"tz": "America/Los_Angeles", "days": [0, 1, 2, 3, 4], "start_hour": 5, "end_hour": 11}
+```
+
+`days` counts Monday as 0. The speed colors in the week grid come from the data this Pi collects, so they get more accurate over the first week.
 
 ## Handy commands
 

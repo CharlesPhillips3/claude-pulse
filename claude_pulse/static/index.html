@@ -88,6 +88,15 @@ form.usage .full{grid-column:span 2;display:flex;gap:8px;justify-content:flex-en
 @media(max-width:600px){.tl-axis{grid-template-columns:100px 1fr 56px}}
 .tl-axis .ticks{position:relative;height:16px}
 .tl-axis .ticks span{position:absolute;transform:translateX(-50%);white-space:nowrap}
+.bt-now{display:flex;align-items:center;gap:12px;background:var(--panel2);border-radius:10px;padding:10px 12px;margin-bottom:10px}
+.bt-now .big2{font-size:16px;font-weight:650}
+.bt-grid{display:grid;grid-template-columns:34px repeat(24,1fr);gap:2px;font-size:10px;color:var(--dim);align-items:center}
+.bt-grid .c{height:18px;border-radius:3px;position:relative}
+.bt-grid .c.peak{box-shadow:inset 0 0 0 1.5px #e07a52}
+.bt-grid .c.now{outline:2px solid #fff;outline-offset:1px;z-index:1}
+.bt-grid .lbl{text-align:center}
+.bt-best{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.bt-best .item{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
 .hours{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;margin-top:6px}
 .hours div{height:26px;border-radius:3px;background:var(--panel2);position:relative}
 .hours-lbl{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;font-size:10px;color:var(--dim);text-align:center}
@@ -172,6 +181,12 @@ footer{grid-column:span 12;color:var(--dim);font-size:12px;text-align:center;pad
       <h2 style="margin-top:16px">Usage · last 4 days <span class="right muted">% used</span></h2>
       <div class="chart" id="usageChart"></div>
       <div class="legend" id="usageLegend"></div>
+    </div>
+    <div id="bestTime">
+      <h2 style="margin-top:16px">Best time to use Claude <span class="right muted" id="btNote"></span></h2>
+      <div id="btNow"></div>
+      <div id="btGrid"></div>
+      <div id="btBest"></div>
     </div>
     <div id="rlWrap">
       <h2 style="margin-top:16px">API rate limits <span class="right muted" id="rlAt"></span></h2>
@@ -333,7 +348,7 @@ function renderState() {
   if (S.jobs.stock?.err && q.price == null) $("#stockStats").insertAdjacentHTML("beforebegin", `<div class="errbox" id="stockErr">Couldn't get the ANT price yet: ${esc(S.jobs.stock.err)}</div>`);
   renderUpdateBtn();
 
-  renderStatus(); renderModels(); renderUsage(); renderRadar(); renderNews(); renderFooter();
+  renderStatus(); renderModels(); renderUsage(); renderRadar(); renderNews(); renderFooter(); renderBestTime();
 }
 
 function renderStockChart() {
@@ -587,9 +602,66 @@ function renderFooter() {
     + (bad.length ? `<div style="margin-top:6px;color:#c98a7f">Problems: ${bad.map(([k, j]) => esc(k) + " (" + esc(j.err) + ")").join(" · ")}</div>` : "");
 }
 
-function renderHistory() { renderStockChart(); renderTimeline(); renderProbeCharts(); renderUsageChart(); }
+function renderHistory() { renderStockChart(); renderTimeline(); renderProbeCharts(); renderUsageChart(); renderBestTime(); }
 function tick() { document.querySelectorAll("[data-cd]").forEach(el => el.textContent = countdown(+el.dataset.cd)); }
 
+
+
+// ---------- best time to use Claude
+const DOWS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+function tzParts(ts, tz) { const p = {}; new Intl.DateTimeFormat("en-US", {timeZone: tz, hour12: false, weekday: "short", hour: "2-digit", minute: "2-digit"}).formatToParts(new Date(ts * 1000)).forEach(x => p[x.type] = x.value); return {dow: DOWS.indexOf(p.weekday), hour: (+p.hour) % 24, min: +p.minute}; }
+function isPeak(ts) { const ph = S?.config?.peak_hours; if (!ph) return false; const p = tzParts(ts, ph.tz); return ph.days.includes(p.dow) && p.hour >= ph.start_hour && p.hour < ph.end_hour; }
+function nextChange(ts) { const cur = isPeak(ts); for (let t = Math.ceil((ts + 1) / 900) * 900; t < ts + 8 * 86400; t += 900) if (isPeak(t) !== cur) return t; return null; }
+const ETh = new Intl.DateTimeFormat("en-US", {timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit"});
+function etWhen(ts) { const today = ETday.format(new Date(S.now * 1000)), d = ETday.format(new Date(ts * 1000));
+  const tmw = ETday.format(new Date((S.now + 86400) * 1000)); const time = new Intl.DateTimeFormat("en-US", {timeZone: "America/New_York", hour: "numeric", minute: "2-digit"}).format(new Date(ts * 1000));
+  return (d === today ? "Today " : d === tmw ? "Tomorrow " : ETh.format(new Date(ts * 1000)).split(" ")[0] + " ") + time; }
+function loadColor(r) { const t = Math.max(0, Math.min(1, (r - 0.85) / 0.5)); return `hsl(${140 - t * 140},50%,${30 + t * 8}%)`; }
+function renderBestTime() {
+  if (!S) return;
+  const ph = S.config.peak_hours, now = Math.floor(Date.now() / 1000);
+  const peak = isPeak(now), nc = nextChange(now);
+  $("#btNow").innerHTML = `<div class="bt-now"><span class="dot ${peak ? "l2" : "l0"}" style="width:12px;height:12px"></span>
+    <div style="flex:1;min-width:0"><div class="big2">${peak ? "Peak hours now" : "Off-peak now: good time to use Claude"}</div>
+    <div class="muted" style="font-size:12px">${peak ? "Your 5-hour session drains faster right now." : "Your 5-hour session stretches further now."}${nc ? ` ${peak ? "Off-peak" : "Peak"} starts ${esc(etWhen(nc))} · in <span class="cd" data-cd="${nc}"></span>` : ""}</div></div></div>`;
+  // Week grid (Eastern time).
+  const lg = H?.load_grid || {cells: []}; const cell = {}; lg.cells.forEach(c => { if (c.n >= 2) cell[c.dow + "-" + c.hour] = c; });
+  // Fallback for hours we haven't seen on that weekday yet: same hour, other weekdays (or weekend days).
+  const byHour = {}; lg.cells.forEach(c => { if (c.n < 2) return; const k = (c.dow >= 5 ? "we" : "wd") + c.hour; (byHour[k] = byHour[k] || []).push(c.ratio); });
+  const estimate = (dow, hour) => cell[dow + "-" + hour]?.ratio ?? (v => v ? v.reduce((a, x) => a + x, 0) / v.length : null)(byHour[(dow >= 5 ? "we" : "wd") + hour]);
+  const np = tzParts(now, "America/New_York");
+  const refTs = (dow, hour) => { const off = ((dow - np.dow) + 7) % 7; return now - np.min * 60 - (now % 60) + off * 86400 + (hour - np.hour) * 3600; };
+  let g = `<div class="bt-grid"><div></div>${Array.from({length: 24}, (_, h) => `<div class="lbl">${h % 3 === 0 ? (h % 12 || 12) + (h < 12 ? "a" : "p") : ""}</div>`).join("")}`;
+  for (let d = 0; d < 7; d++) {
+    g += `<div>${DOWS[d]}</div>`;
+    for (let h = 0; h < 24; h++) {
+      const pk = isPeak(refTs(d, h) + 1800), c = cell[d + "-" + h];
+      const bg = c ? loadColor(c.ratio) : (pk ? "#4a3022" : "#1f3328");
+      const tip = `${DOWS[d]} ${h % 12 || 12}${h < 12 ? " AM" : " PM"} ET · ${pk ? "peak hours (session drains faster)" : "off-peak"}${c ? ` · speed ${c.ratio < 0.95 ? "faster than usual" : c.ratio < 1.15 ? "normal" : "slower than usual"} (${c.ratio.toFixed(2)}× typical wait, ${c.n} samples)` : ""}`;
+      g += `<div class="c ${pk ? "peak" : ""} ${d === np.dow && h === np.hour ? "now" : ""}" style="background:${bg}" title="${esc(tip)}"></div>`;
+    }
+  }
+  g += `</div><div class="legend"><span><i style="background:#1f3328;height:8px"></i>off-peak</span><span><i style="background:#4a3022;height:8px;box-shadow:inset 0 0 0 1.5px #e07a52"></i>peak hours</span>${lg.cells.length ? `<span><i style="background:hsl(140,50%,30%);height:8px"></i>quick</span><span><i style="background:hsl(0,50%,38%);height:8px"></i>slow (measured)</span>` : ""}<span><i style="background:transparent;outline:2px solid #fff;height:8px"></i>now</span></div>`;
+  $("#btGrid").innerHTML = g;
+  $("#btNote").textContent = lg.cells.length ? `Eastern time · speed from ${lg.days_of_data} days of data` : "Eastern time";
+  // Best windows in the next 48 hours: 3-hour off-peak blocks, quickest first when we have speed data.
+  const blocks = [];
+  const start = Math.ceil(now / 3600) * 3600;
+  for (let t = start; t < start + 48 * 3600; t += 3600) {
+    if (isPeak(t + 1800)) continue;
+    const p = tzParts(t, "America/New_York"); const r = estimate(p.dow, p.hour);
+    const last = blocks[blocks.length - 1];
+    if (last && last.end === t && last.hours < 3) { last.end = t + 3600; last.hours++; if (r != null) last.r.push(r); }
+    else blocks.push({start: t, end: t + 3600, hours: 1, r: r != null ? [r] : []});
+  }
+  const scored = blocks.filter(b => b.hours >= 2).map(b => ({...b, avg: b.r.length ? b.r.reduce((a, x) => a + x, 0) / b.r.length : null}));
+  const haveSpeed = scored.some(b => b.avg != null);
+  const pick = (haveSpeed ? scored.filter(b => b.avg != null).sort((a, b) => a.avg - b.avg) : scored).slice(0, 3).sort((a, b) => a.start - b.start);
+  const nightNote = b => { const h = tzParts(b.start, "America/New_York").hour; return h >= 0 && h < 6 ? " (late night)" : ""; };
+  $("#btBest").innerHTML = `<div class="muted" style="font-size:12px;margin-top:10px">${haveSpeed ? "Quickest off-peak windows in the next 48 hours:" : "Next off-peak windows (speed data still building):"}</div>
+    <div class="bt-best">${pick.map(b => `<div class="item"><b>${esc(etWhen(b.start))} – ${esc(new Intl.DateTimeFormat("en-US", {timeZone: "America/New_York", hour: "numeric", minute: "2-digit"}).format(new Date(b.end * 1000)))}${nightNote(b)}</b><span class="muted" style="font-size:12px">${b.avg != null ? (b.avg < 0.95 ? "faster than usual" : b.avg < 1.15 ? "normal speed" : "a bit slower") : "off-peak"}</span></div>`).join("") || `<div class="dim">—</div>`}</div>
+    <div class="note">Peak hours are Anthropic's announced window (${ph ? `weekdays ${ph.start_hour}–${ph.end_hour} ${ph.tz.includes("Los_Angeles") ? "PT, 8 AM–2 PM ET" : ph.tz}` : "not set"}): your 5-hour session drains faster then, off-peak it lasts longer. Weekly limits are the same at any hour.</div>`;
+}
 
 // ---------- self-update
 let updating = false;

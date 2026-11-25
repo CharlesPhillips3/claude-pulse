@@ -38,7 +38,7 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
 CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
 ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 REPO = "CharlesPhillips3/claude-pulse"
 REPO_BRANCH = "main"
 
@@ -54,6 +54,9 @@ DEFAULT_CONFIG = {
     "openrouter_api_key": "",
     "openrouter_models": [],
     "claude_usage_auto": True,
+    # Anthropic's announced peak window (Mar 2026): weekdays 5-11 AM Pacific = 8 AM-2 PM Eastern.
+    # 5-hour sessions drain faster then; weekly limits are the same at any hour.
+    "peak_hours": {"tz": "America/Los_Angeles", "days": [0, 1, 2, 3, 4], "start_hour": 5, "end_hour": 11},
     "claude_credentials_path": "",
     "probe_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"],
     "probe_interval_min": 15,
@@ -796,6 +799,32 @@ def probe_summary():
     return out
 
 
+def load_grid():
+    """Typical load by weekday and hour (Eastern): each model's first-token wait divided by
+    that model's own median, averaged, so fast and slow models count equally."""
+    since = int(time.time()) - 30 * 86400
+    rows = DB_.query("SELECT ts, model, ttft FROM orstat WHERE ttft IS NOT NULL AND ts>=? AND provider LIKE '%Anthropic%'",
+                     (since,))
+    src = "openrouter"
+    if len(rows) < 50:
+        rows = DB_.query("SELECT ts, model, ttft FROM probe WHERE ok=1 AND ttft IS NOT NULL AND ts>=?", (since,))
+        src = "probes"
+    by_model = {}
+    for ts, model, ttft in rows:
+        by_model.setdefault(model, []).append(ttft)
+    med = {m: statistics.median(v) for m, v in by_model.items() if v}
+    cells = {}
+    for ts, model, ttft in rows:
+        if not med.get(model):
+            continue
+        d = datetime.fromtimestamp(ts, ET_TZ)
+        cells.setdefault((d.weekday(), d.hour), []).append(ttft / med[model])
+    grid = [{"dow": k[0], "hour": k[1], "ratio": round(statistics.mean(v), 3), "n": len(v)}
+            for k, v in sorted(cells.items())]
+    return {"source": src if rows else None, "cells": grid, "days_of_data": round(
+        (max(r[0] for r in rows) - min(r[0] for r in rows)) / 86400, 1) if rows else 0}
+
+
 def hourly_profile():
     """Average time-to-first-token by hour of day (ET) across all stored probes."""
     since = int(time.time()) - 30 * 86400
@@ -1298,6 +1327,7 @@ def api_state():
         "config": {"ticker": CFG["ticker"], "ipo_price": CFG["ipo_price"], "ipo_date": CFG.get("ipo_date"),
                    "has_key": bool(CFG.get("anthropic_api_key")), "probe_interval_min": CFG.get("probe_interval_min"),
                    "has_or_key": bool(CFG.get("openrouter_api_key")),
+                   "peak_hours": CFG.get("peak_hours"),
                    "offline": bool(CFG.get("offline"))},
         "quote": s["quote"],
         "peers": s["peers"],
@@ -1347,6 +1377,7 @@ def api_history(days):
         "usage_hist": usage_hist(start),
         "timeline": build_timeline(start, end),
         "hourly": hourly_profile(),
+        "load_grid": load_grid(),
     }
 
 
