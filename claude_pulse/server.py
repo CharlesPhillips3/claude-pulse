@@ -59,7 +59,7 @@ try:
     ET_TZ = ZoneInfo("America/New_York")
 except ZoneInfoNotFoundError:
     sys.exit("Claude Pulse needs time-zone data. Run:  python -m pip install tzdata")
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 REPO = "CharlesPhillips3/claude-pulse"
 REPO_BRANCH = "main"
 
@@ -464,10 +464,6 @@ def collect_stock():
         if pts and m.get("regularMarketTime") and pts[-1][0] > m["regularMarketTime"] + 60 and price:
             quote["ext_price"], quote["ext_time"] = pts[-1][1], pts[-1][0]
         save_points(sym, pts)
-        try:
-            save_points(sym, series_points(yahoo_chart(sym, "5d", "5m", prepost=True)), replace=False)
-        except Exception as e:
-            job_err("stock_5d", e)
     except Exception as e:
         errors.append(f"Yahoo: {e}")
         for name, fn in (("Nasdaq", nasdaq_quote), ("Stooq", stooq_quote)):
@@ -501,30 +497,81 @@ def collect_stock():
     set_state("quote", quote)
 
 
-def collect_daily():
+HIST_STATE = {"days": 0}
+
+
+def stock_days():
+    rows = DB_.query("SELECT ts FROM stock WHERE symbol=? AND ts>=?", (CFG["ticker"], int(time.time()) - 10 * 86400))
+    return len({datetime.fromtimestamp(t, ET_TZ).date() for (t,) in rows})
+
+
+def collect_backfill():
+    """Last few trading days of intraday prices (for the 4D chart)."""
     sym = CFG["ticker"]
+    errors = []
+    for rng, iv in (("5d", "5m"), ("5d", "15m"), ("1mo", "30m")):
+        try:
+            pts = series_points(yahoo_chart(sym, rng, iv, prepost=True))
+            if pts:
+                save_points(sym, pts, replace=False)
+                break
+        except Exception as e:
+            errors.append(f"{rng}/{iv}: {e}")
+    HIST_STATE["days"] = stock_days()
+    if errors and HIST_STATE["days"] < 2:
+        raise RuntimeError("couldn't download older prices (" + "; ".join(errors)[:200] + ")")
+
+
+def nasdaq_daily(sym):
+    start = (CFG.get("ipo_date") or (datetime.now(ET_TZ) - timedelta(days=90)).date().isoformat())
+    d = nasdaq_get(f"/quote/{sym}/historical?assetclass=stocks&fromdate={start}"
+                   f"&todate={datetime.now(ET_TZ).date().isoformat()}&limit=200")
+    rows = []
+    for r in ((d.get("tradesTable") or {}).get("rows") or []):
+        try:
+            day = datetime.strptime(r.get("date", ""), "%m/%d/%Y").date().isoformat()
+        except ValueError:
+            continue
+        c = _num(r.get("close"))
+        if c is not None:
+            rows.append((sym, day, _num(r.get("open")), _num(r.get("high")), _num(r.get("low")), c, _num(r.get("volume"))))
+    if not rows:
+        raise RuntimeError("Nasdaq history empty")
+    return rows
+
+
+def collect_daily():
+    """Daily closes since the IPO (for the Since IPO chart)."""
+    sym = CFG["ticker"]
+    rows, errors = [], []
     try:
         r = yahoo_chart(sym, "3mo", "1d")
-    except Exception:
-        # Without Yahoo, keep a daily close from the latest quote after the close.
-        q = STATE.get("quote") or {}
-        if q.get("price") is not None and market_state() in ("post", "closed"):
-            day = datetime.now(ET_TZ).date().isoformat()
-            if datetime.now(ET_TZ).weekday() < 5 and day not in HOLIDAYS:
-                DB_.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?,?,?)",
-                            (sym, day, None, q.get("day_high"), q.get("day_low"), q["price"], q.get("volume")))
-            return
-        raise
-    ts = r.get("timestamp") or []
-    q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
-    rows = []
-    for i, t in enumerate(ts):
-        c = (q.get("close") or [None])[i]
-        if c is None:
-            continue
-        day = datetime.fromtimestamp(t, ET_TZ).date().isoformat()
-        rows.append((sym, day, q["open"][i], q["high"][i], q["low"][i], c, q["volume"][i]))
-    DB_.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?,?,?)", rows, many=True)
+        ts = r.get("timestamp") or []
+        q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
+        for i, t in enumerate(ts):
+            c = (q.get("close") or [None])[i]
+            if c is None:
+                continue
+            day = datetime.fromtimestamp(t, ET_TZ).date().isoformat()
+            rows.append((sym, day, q["open"][i], q["high"][i], q["low"][i], c, q["volume"][i]))
+    except Exception as e:
+        errors.append(f"Yahoo: {e}")
+    if not rows:
+        try:
+            rows = nasdaq_daily(sym)
+        except Exception as e:
+            errors.append(f"Nasdaq: {e}")
+    if rows:
+        DB_.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?,?,?)", rows, many=True)
+    # Always keep today's close from the live quote once the market has closed.
+    q = STATE.get("quote") or {}
+    now = datetime.now(ET_TZ)
+    if q.get("price") is not None and market_state() in ("post", "closed") and now.weekday() < 5 \
+            and now.date().isoformat() not in HOLIDAYS and now.hour >= 16:
+        DB_.execute("INSERT OR IGNORE INTO daily VALUES(?,?,?,?,?,?,?)",
+                    (sym, now.date().isoformat(), None, q.get("day_high"), q.get("day_low"), q["price"], q.get("volume")))
+    if not rows:
+        raise RuntimeError("; ".join(errors)[:300])
 
 
 def collect_peers():
@@ -1310,7 +1357,8 @@ def stock_interval():
 
 JOBS = [
     ("stock", collect_stock, stock_interval),
-    ("daily", collect_daily, lambda: 1800),
+    ("daily", collect_daily, lambda: 1800 if DB_.query("SELECT COUNT(*) FROM daily")[0][0] >= 2 else 180),
+    ("backfill", collect_backfill, lambda: 1800 if HIST_STATE["days"] >= 4 else 180),
     ("peers", collect_peers, lambda: 300 if market_state() == "open" else 1800),
     ("status", collect_status, lambda: 120),
     ("incidents", collect_incidents, lambda: 600),
@@ -1362,7 +1410,7 @@ def scheduler():
                 threading.Thread(target=run, args=(name, fn), daemon=True, name=name).start()
         if KICK.wait(5):
             KICK.clear()
-            for name in ("stock", "peers", "status", "incidents", "news", "plan_usage"):
+            for name in ("stock", "peers", "status", "incidents", "news", "plan_usage", "backfill", "daily"):
                 next_run[name] = 0
 
 
