@@ -38,7 +38,7 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
 CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
 ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 REPO = "CharlesPhillips3/claude-pulse"
 REPO_BRANCH = "main"
 

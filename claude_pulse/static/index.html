@@ -102,7 +102,7 @@ footer{grid-column:span 12;color:var(--dim);font-size:12px;text-align:center;pad
 <header>
   <img src="/icon.svg" alt="">
   <div>
-    <h1>Claude Pulse</h1>
+    <h1>Claude Pulse <span id="ver" class="pill" style="font-size:11px;padding:1px 8px;vertical-align:3px;font-weight:500"></span></h1>
     <div class="sub" id="updated">Loading…</div>
   </div>
   <div class="spacer"></div>
@@ -306,6 +306,7 @@ async function loadHistory() { try { H = await getJSON("/api/history?days=" + (s
 // ---------- header + stock
 function renderState() {
   const q = S.quote || {};
+  $("#ver").textContent = "v" + S.version;
   $("#updated").textContent = "Updated " + new Date(S.now * 1000).toLocaleTimeString() + (S.config.offline ? " · OFFLINE MODE" : "");
   // status pill
   const st = S.status; const lvl = {none: 0, minor: 1, major: 2, critical: 3}[st?.indicator] ?? null;
