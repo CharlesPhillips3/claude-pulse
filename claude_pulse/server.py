@@ -31,19 +31,40 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from zoneinfo import ZoneInfo
+import subprocess
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+IS_WIN = os.name == "nt"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
-DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
-CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
-ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.4.0"
+if IS_WIN:
+    _LOCAL = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+    _ROAM = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+    _DEF_DATA = os.path.join(_LOCAL, "ClaudePulse", "data")
+    _DEF_CONFIG = os.path.join(_ROAM, "ClaudePulse", "config.json")
+else:
+    _DEF_DATA = os.path.expanduser("~/.local/share/claude-pulse")
+    _DEF_CONFIG = os.path.expanduser("~/.config/claude-pulse/config.json")
+DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", _DEF_DATA)
+CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", _DEF_CONFIG)
+
+# Started with pythonw.exe (Windows, no console) there is nowhere to print: log to a file instead.
+if sys.stdout is None or sys.stderr is None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _log = open(os.path.join(DATA_DIR, "claude-pulse.log"), "a", buffering=1, encoding="utf-8")
+    sys.stdout = sys.stdout or _log
+    sys.stderr = sys.stderr or _log
+
+try:
+    ET_TZ = ZoneInfo("America/New_York")
+except ZoneInfoNotFoundError:
+    sys.exit("Claude Pulse needs time-zone data. Run:  python -m pip install tzdata")
+VERSION = "1.5.0"
 REPO = "CharlesPhillips3/claude-pulse"
 REPO_BRANCH = "main"
 
 DEFAULT_CONFIG = {
-    "bind": "0.0.0.0",
+    "bind": "127.0.0.1" if IS_WIN else "0.0.0.0",
     "port": 8787,
     "ticker": "ANT",
     "ipo_price": 83.0,
@@ -102,6 +123,25 @@ def load_config():
 
 
 CFG = load_config()
+_CFG_MTIME = [None]
+
+
+def reload_config():
+    """Pick up edits to config.json (keys, models, peak hours) without a restart."""
+    try:
+        m = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return
+    if _CFG_MTIME[0] is None:
+        _CFG_MTIME[0] = m
+        return
+    if m != _CFG_MTIME[0]:
+        _CFG_MTIME[0] = m
+        new = load_config()
+        for k in ("port", "bind"):
+            new[k] = CFG[k]  # these need a restart
+        CFG.update(new)
+        KICK.set()
 
 
 # --------------------------------------------------------------------------- storage
@@ -1197,6 +1237,15 @@ def check_update():
 UPDATE_LOCK = threading.Lock()
 
 
+def restart_self():
+    args = [sys.executable, os.path.join(APP_DIR, "server.py")]
+    if IS_WIN:
+        # Windows can't replace a running process: start a fresh one (it waits for the port), then exit.
+        subprocess.Popen(args, creationflags=0x00000008 | 0x00000200, close_fds=True)  # DETACHED | NEW_GROUP
+        os._exit(0)
+    os.execv(sys.executable, args)
+
+
 def do_update():
     """Download the latest app from GitHub, replace the app files, then restart."""
     if not UPDATE_LOCK.acquire(blocking=False):
@@ -1232,15 +1281,17 @@ def do_update():
                 shutil.copy2(os.path.join(dirpath, fn), tmp_dst)
                 os.replace(tmp_dst, os.path.join(dst_dir, fn))
         parent = os.path.dirname(APP_DIR)
-        for fn in ("README.md", "uninstall.sh", "install.sh", "get.sh", "config.example.json"):
+        extras = ["README.md", "config.example.json"] + (
+            [os.path.join("windows", "uninstall.ps1")] if IS_WIN else ["uninstall.sh", "install.sh", "get.sh"])
+        for fn in extras:
             src = os.path.join(src_root, fn)
             if os.path.exists(src) and os.access(parent, os.W_OK):
-                shutil.copy2(src, os.path.join(parent, fn))
+                shutil.copy2(src, os.path.join(parent, os.path.basename(fn)))
         shutil.rmtree(tmp, ignore_errors=True)
 
         def restart():
             time.sleep(1.5)
-            os.execv(sys.executable, [sys.executable, os.path.join(APP_DIR, "server.py")])
+            restart_self()
         threading.Thread(target=restart, daemon=True).start()
         return {"ok": True, "from": VERSION, "to": new_version}
     except Exception:
@@ -1271,6 +1322,7 @@ JOBS = [
     ("plan_usage", collect_plan_usage, lambda: 300),
     ("update_check", check_update, lambda: 6 * 3600),
     ("prune", lambda: prune(), lambda: 86400),
+    ("config", reload_config, lambda: 30),
 ]
 
 
@@ -1328,6 +1380,7 @@ def api_state():
                    "has_key": bool(CFG.get("anthropic_api_key")), "probe_interval_min": CFG.get("probe_interval_min"),
                    "has_or_key": bool(CFG.get("openrouter_api_key")),
                    "peak_hours": CFG.get("peak_hours"),
+                   "platform": "windows" if IS_WIN else "linux",
                    "offline": bool(CFG.get("offline"))},
         "quote": s["quote"],
         "peers": s["peers"],
@@ -1458,9 +1511,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 400)
 
 
+class PulseServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # On Windows SO_REUSEADDR would let a second copy bind the same port; use exclusive binding instead.
+    allow_reuse_address = not IS_WIN
+
+    def server_bind(self):
+        if IS_WIN and hasattr(__import__("socket"), "SO_EXCLUSIVEADDRUSE"):
+            import socket
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def bind_server():
+    """Bind the port, waiting a little if an old copy (e.g. during an update restart) still holds it."""
+    last = None
+    for _ in range(20):
+        try:
+            return PulseServer((CFG["bind"], int(CFG["port"])), Handler)
+        except OSError as e:
+            last = e
+            time.sleep(1)
+    sys.exit(f"Claude Pulse: port {CFG['port']} is busy ({last}). Is another copy already running?")
+
+
 def main():
+    srv = bind_server()
     threading.Thread(target=scheduler, daemon=True, name="scheduler").start()
-    srv = ThreadingHTTPServer((CFG["bind"], int(CFG["port"])), Handler)
     print(f"Claude Pulse {VERSION} on http://{CFG['bind']}:{CFG['port']}  (data: {DATA_DIR})", flush=True)
     if not CFG.get("anthropic_api_key"):
         print("No Anthropic API key set: model speed probes are off.", flush=True)

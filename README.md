@@ -1,6 +1,6 @@
 # Claude Pulse
 
-A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5 (or any Linux machine with Python 3.9+). It uses only the Python standard library, so there's nothing to `pip install`.
+A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5, any Linux machine, or a **Windows 10/11 PC** (Python 3.9+). It uses only the Python standard library, so there's nothing to `pip install` (on Windows the installer adds the small `tzdata` package, since Windows has no built-in time-zone database).
 
 ![Claude Pulse dashboard](docs/preview.png)
 
@@ -17,7 +17,7 @@ A local dashboard for Anthropic and Claude that runs on a Raspberry Pi 5 (or any
 - **Release radar.** Checks the Claude model list every hour (OpenRouter's public list, or Anthropic's with a key) and flags any new model, plus headlines about releases.
 - **News.** Headlines from the last week, filterable by Releases, Stock and Outages.
 
-## Install (one line)
+## Install on a Raspberry Pi / Linux (one line)
 
 Open a terminal on the Pi and paste:
 
@@ -42,6 +42,32 @@ The installer:
 
 Then double-click the desktop icon, or browse to `http://localhost:8787`. Other devices on your network can use `http://<pi-ip>:8787`.
 
+## Install on Windows (one line)
+
+Open **PowerShell** (Start menu → type "PowerShell") and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/CharlesPhillips3/claude-pulse/main/windows/get.ps1 | iex
+```
+
+The installer:
+
+- installs Python 3.12 for your user account if you don't have it (through winget, no admin needed)
+- copies the app to `%LOCALAPPDATA%\ClaudePulse`
+- puts a **Claude Pulse icon on your desktop** and in the Start menu
+- starts the data collector quietly in the background at every sign-in, with no window
+- optionally asks for a free OpenRouter key and an Anthropic API key (both can be skipped)
+
+Double-click the desktop icon to open the dashboard in its own window. Updates work the same as on the Pi: press **⬆ Update** at the top, or run the line again.
+
+Prefer not to paste a command? Download the repo as a ZIP (green **Code** button → **Download ZIP**), unzip it, open the `windows` folder and double-click **install.cmd**.
+
+On Windows the dashboard is only reachable from the PC itself (`"bind": "127.0.0.1"`), so there's no firewall prompt. Settings live in `%APPDATA%\ClaudePulse\config.json`, history and the log in `%LOCALAPPDATA%\ClaudePulse\data`.
+
+For automatic plan usage on Windows, install Claude Code in PowerShell with `irm https://claude.ai/install.ps1 | iex`, then run `claude` once and sign in.
+
+To uninstall: `powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\ClaudePulse\app\uninstall.ps1"` (add `-Purge` to delete settings and history too).
+
 ## Model speed: free OpenRouter key (recommended)
 
 Without any key, the dashboard already shows each Claude model's live uptime from OpenRouter.
@@ -50,7 +76,7 @@ For speed numbers (time to first token and tokens/second):
 
 1. Sign in at https://openrouter.ai/settings/keys and click **Create Key**. It's free, and reading these stats needs no credits.
 2. Paste it when the installer asks, or put it in `~/.config/claude-pulse/config.json` as `"openrouter_api_key": "sk-or-..."`.
-3. Run `sudo systemctl restart claude-pulse`.
+3. That's it: changes to the config are picked up within a minute.
 
 The app picks the newest Haiku, Sonnet, Opus and Fable/Mythos models automatically. To choose them yourself, list OpenRouter model ids in `openrouter_models`.
 
@@ -92,7 +118,7 @@ Anthropic's announced peak window is weekdays 5–11 AM Pacific (8 AM–2 PM Eas
 ```bash
 systemctl status claude-pulse          # is it running?
 journalctl -u claude-pulse -f          # live log
-sudo systemctl restart claude-pulse    # after editing the config
+sudo systemctl restart claude-pulse    # restart (config edits are picked up automatically)
 ./uninstall.sh                         # remove (add --purge to delete history + config)
 ```
 

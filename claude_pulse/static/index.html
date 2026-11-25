@@ -227,6 +227,13 @@ const safeUrl = u => (typeof u === "string" && /^https?:\/\//i.test(u)) ? u : nu
 const COLORS = ["#6aa7e8", "#4cc3bd", "#e07a52", "#b48ef0", "#e6b84f", "#4fbf86"];
 let S = null, H = null, stockRange = "4d", newsFilter = "all";
 
+// ---------- platform wording (Pi / Linux vs Windows PC)
+const onWin = () => S?.config?.platform === "windows";
+const HOST = () => onWin() ? "this PC" : "this Pi";
+const CONF_PATH = () => onWin() ? "%APPDATA%\\ClaudePulse\\config.json" : "~/.config/claude-pulse/config.json";
+const TERMINAL = () => onWin() ? "PowerShell" : "a terminal";
+const CC_INSTALL = () => onWin() ? "irm https://claude.ai/install.ps1 | iex" : "curl -fsSL https://claude.ai/install.sh | bash";
+
 // ---------- formatting
 const fmtUSD = (v, d = 2) => v == null ? "—" : "$" + Number(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
 const fmtPct = v => v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
@@ -416,7 +423,7 @@ function renderTimeline() {
     <div class="tl-track">${r.intervals.map(iv => `<span title="${esc(iv.label + " · " + fmtTime(iv.start) + " – " + fmtTime(iv.end))}" style="left:${(iv.start - start) / span * 100}%;width:${Math.max(0.25, (iv.end - iv.start) / span * 100)}%;background:${color(iv.level)}"></span>`).join("")}</div>
     <div class="num ${r.uptime_pct < 99 ? "down" : "muted"}">${r.uptime_pct.toFixed(2)}%</div></div>`).join("")
     + `<div class="tl-axis"><div></div><div class="ticks">${ticks}</div><div class="num">uptime</div></div>`;
-  $("#tlNote").textContent = tl.sampled_since ? "from incident reports + this Pi's checks since " + fmtTime(tl.sampled_since) : "from incident reports";
+  $("#tlNote").textContent = tl.sampled_since ? "from incident reports + " + HOST() + "'s checks since " + fmtTime(tl.sampled_since) : "from incident reports";
 }
 
 // ---------- models
@@ -437,7 +444,7 @@ function renderModels() {
   if (src === "or") {
     $("#probeInfo").textContent = "OpenRouter · every 5 min";
     if (!hasSpeed && rows.some(r => r.at) && !S.config.has_or_key)
-      note += `<div class="warnbox">Uptime is live. For speed numbers, add a <b>free OpenRouter key</b> (no credits needed): sign in at openrouter.ai → <b>Keys</b> → Create, then put it in <code>~/.config/claude-pulse/config.json</code> as <code>"openrouter_api_key"</code> and run <code>sudo systemctl restart claude-pulse</code>.</div>`;
+      note += `<div class="warnbox">Uptime is live. For speed numbers, add a <b>free OpenRouter key</b> (no credits needed): sign in at openrouter.ai → <b>Keys</b> → Create, then put it in <code>${esc(CONF_PATH())}</code> as <code>"openrouter_api_key"</code>. It's picked up within a minute.</div>`;
     if (S.jobs.openrouter?.err) note += `<div class="errbox">OpenRouter: ${esc(S.jobs.openrouter.err)}</div>`;
     note += `<div class="note" style="margin:0 0 8px">Live from OpenRouter's real traffic to each Claude model: median of the last 30 minutes${rows[0]?.provider ? ", " + esc(rows[0].provider) + " endpoint" : ""}.</div>`;
   } else {
@@ -509,7 +516,7 @@ function renderUsage() {
   const live = pu.status === "ok" || ((pu.status === "expired" || pu.status === "error") && pu.meters?.length);
   let h = "";
   if (pu.status === "expired")
-    h += `<div class="warnbox">Claude Code's sign-in on this Pi has expired, so usage can't be read right now${pu.last_ok ? " (last reading " + esc(ago(pu.last_ok)) + ")" : ""}. Open a terminal on the Pi and run <code>claude</code> once. It refreshes the sign-in, and this updates within 5 minutes.</div>`;
+    h += `<div class="warnbox">Claude Code's sign-in on ${HOST()} has expired, so usage can't be read right now${pu.last_ok ? " (last reading " + esc(ago(pu.last_ok)) + ")" : ""}. Open ${TERMINAL()} on ${HOST()} and run <code>claude</code> once. It refreshes the sign-in, and this updates within 5 minutes.</div>`;
   else if (pu.status === "error")
     h += `<div class="errbox">Couldn't read usage from Anthropic (${esc(S.jobs.plan_usage?.err || "HTTP " + pu.code)}). Showing the last reading.</div>`;
   if (live) {
@@ -520,7 +527,7 @@ function renderUsage() {
   } else {
     $("#btnUsage").style.display = "";
     if (pu.status === "no_claude_code")
-      h += `<div class="note" style="margin-top:0">To fill this in automatically, install Claude Code on this Pi and sign in once with your Claude account:<br><code>curl -fsSL https://claude.ai/install.sh | bash</code> then run <code>claude</code>. This checks for it every 5 minutes. Until then you can type the numbers in with <b>Update</b>.</div>`;
+      h += `<div class="note" style="margin-top:0">To fill this in automatically, install Claude Code on ${HOST()} and sign in once with your Claude account. In ${TERMINAL()}:<br><code>${esc(CC_INSTALL())}</code> then run <code>claude</code>. This checks for it every 5 minutes. Until then you can type the numbers in with <b>Update</b>.</div>`;
     if (!u.updated) {
       if (pu.status !== "no_claude_code") h += `<div class="note" style="margin-top:0">Copy your usage from <b>Settings → Usage</b> in Claude and press <b>Update</b>. The countdowns then run here.</div>`;
     } else {
@@ -585,7 +592,7 @@ function renderRadar() {
   if (!am.length) h = `<div class="dim">Checking model list…</div>`;
   else {
     h = fresh.length ? fresh.map(m => `<div class="item"><span class="tag new">new</span><b>${esc(m.display_name)}</b><div class="meta">${esc(m.id)} · spotted ${esc(ago(m.first_seen))}</div></div>`).join("")
-      : `<div class="muted" style="font-size:13px">No new models since this Pi started watching (checks ${esc(S.models_source || "")} hourly). Newest available:</div>`;
+      : `<div class="muted" style="font-size:13px">No new models since ${HOST()} started watching (checks ${esc(S.models_source || "")} hourly). Newest available:</div>`;
     h += `<table style="margin-top:6px">${am.slice(0, 6).map(m => `<tr><td>${esc(m.display_name)}<div class="dim" style="font-size:11px">${esc(m.id)}</div></td><td class="num muted">${m.created ? esc(new Date(m.created * 1000).toLocaleDateString()) : ""}</td></tr>`).join("")}</table>`;
   }
   $("#newModels").innerHTML = h;
@@ -598,7 +605,7 @@ function renderNews() {
 }
 function renderFooter() {
   const bad = Object.entries(S.jobs || {}).filter(([, j]) => j.err);
-  $("#footer").innerHTML = `Claude Pulse ${esc(S.version)} · runs on this Pi · Data: Yahoo Finance / Stooq (quotes may be delayed), status.claude.com, OpenRouter, Anthropic API (optional), Google News. Not investment advice.`
+  $("#footer").innerHTML = `Claude Pulse ${esc(S.version)} · runs on ${HOST()} · Data: Yahoo Finance / Stooq (quotes may be delayed), status.claude.com, OpenRouter, Anthropic API (optional), Google News. Not investment advice.`
     + (bad.length ? `<div style="margin-top:6px;color:#c98a7f">Problems: ${bad.map(([k, j]) => esc(k) + " (" + esc(j.err) + ")").join(" · ")}</div>` : "");
 }
 
