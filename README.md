@@ -24,7 +24,7 @@ Open a terminal on the Pi and paste:
 curl -fsSL https://raw.githubusercontent.com/CharlesPhillips3/claude-pulse/main/get.sh | bash
 ```
 
-Run the same line again any time to **update**. Your settings and history are kept.
+To **update**, press the **⬆ Update** button at the top of the dashboard. It turns orange when a new version is on GitHub, installs it, restarts the app and reloads the page. Running the same line again works too. Either way, your settings and history are kept.
 
 Or install from a clone:
 
@@ -85,7 +85,7 @@ To change the port, set `"port"` in the config and re-run `./install.sh`, so the
 
 ## Data sources and limits
 
-- **Quotes:** Yahoo Finance's public chart endpoint, with Stooq as a fallback. Quotes can be delayed and this isn't investment advice.
+- **Quotes:** Yahoo Finance's public chart endpoint, falling back to Nasdaq.com's quote API and then Stooq. Quotes can be delayed and this isn't investment advice.
 - **Market hours:** The app knows the 2026–2027 Nasdaq holidays and early closes.
 - **Status:** status.claude.com's public Statuspage API, falling back to status.anthropic.com.
 - **Model speed and uptime:** OpenRouter's public endpoint stats (30-minute medians).

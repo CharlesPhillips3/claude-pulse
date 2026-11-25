@@ -11,12 +11,16 @@ library. Background threads collect:
   * News headlines (Google News RSS) tagged for releases / stock / outages
 and stores history in SQLite so the charts can show the last few days.
 """
+import http.cookiejar
 import json
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import traceback
@@ -34,7 +38,9 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
 CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
 ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+REPO = "CharlesPhillips3/claude-pulse"
+REPO_BRANCH = "main"
 
 DEFAULT_CONFIG = {
     "bind": "0.0.0.0",
@@ -244,18 +250,55 @@ def next_market_open(now=None):
 
 # --------------------------------------------------------------------------- stock
 
-def yahoo_chart(symbol, rng, interval, prepost=False):
-    q = urllib.parse.urlencode({"range": rng, "interval": interval,
-                                "includePrePost": "true" if prepost else "false"})
-    last = None
-    for host in ("query1", "query2"):
+# Yahoo now often refuses requests without its cookie + "crumb", so we keep a small session.
+YJAR = http.cookiejar.CookieJar()
+YOPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(YJAR))
+YCRUMB = {"crumb": None, "at": 0}
+
+
+def _yopen(url, timeout=20):
+    if CFG.get("offline"):
+        raise RuntimeError("offline mode")
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*",
+                                               "Accept-Language": "en-US,en;q=0.9"})
+    with YOPENER.open(req, timeout=timeout) as r:
+        return r.read()
+
+
+def yahoo_crumb(force=False):
+    if YCRUMB["crumb"] and not force and time.time() - YCRUMB["at"] < 3600:
+        return YCRUMB["crumb"]
+    for url in ("https://fc.yahoo.com", "https://finance.yahoo.com/"):
         try:
-            j = fetch_json(f"https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{q}",
-                           headers={"Accept": "application/json"})
+            _yopen(url, timeout=15)
+        except Exception:
+            pass  # fc.yahoo.com answers 404 but still sets the cookie
+    crumb = _yopen("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=15).decode().strip()
+    if not crumb or "<" in crumb or len(crumb) > 40:
+        raise RuntimeError("no Yahoo crumb")
+    YCRUMB.update(crumb=crumb, at=time.time())
+    return crumb
+
+
+def yahoo_chart(symbol, rng, interval, prepost=False):
+    params = {"range": rng, "interval": interval, "includePrePost": "true" if prepost else "false"}
+    path = f"/v8/finance/chart/{urllib.parse.quote(symbol)}?"
+    last = None
+    # 1) plain request  2) with cookie + crumb (what Yahoo's own site does)
+    for attempt in ("plain", "crumb", "crumb-refresh"):
+        try:
+            if attempt == "plain":
+                body = _yopen("https://query1.finance.yahoo.com" + path + urllib.parse.urlencode(params))
+            else:
+                q = dict(params, crumb=yahoo_crumb(force=(attempt == "crumb-refresh")))
+                body = _yopen("https://query2.finance.yahoo.com" + path + urllib.parse.urlencode(q))
+            j = json.loads(body)
             res = (j.get("chart") or {}).get("result")
             if res:
                 return res[0]
             last = RuntimeError(json.dumps((j.get("chart") or {}).get("error"))[:200])
+        except urllib.error.HTTPError as e:
+            last = RuntimeError(f"Yahoo HTTP {e.code}")
         except Exception as e:
             last = e
     raise last or RuntimeError("no data")
@@ -276,61 +319,125 @@ def series_points(res):
     return out
 
 
+# --- Nasdaq.com's public quote API (no key; wants browser-like headers)
+NASDAQ_INDEX = {"^IXIC": "COMP", "^GSPC": "SPX", "^NDX": "NDX"}
+
+
+def _num(s):
+    if s in (None, "", "N/A"):
+        return None
+    try:
+        return float(re.sub(r"[^0-9.\-]", "", str(s)))
+    except ValueError:
+        return None
+
+
+def nasdaq_get(path):
+    _, _, b = fetch("https://api.nasdaq.com/api" + path, headers={
+        "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"})
+    j = json.loads(b)
+    if not j.get("data"):
+        raise RuntimeError("Nasdaq: " + json.dumps(j.get("status", {}).get("bCodeMessage") or "no data")[:150])
+    return j["data"]
+
+
+def nasdaq_quote(symbol):
+    sym, cls = (NASDAQ_INDEX[symbol], "index") if symbol in NASDAQ_INDEX else (symbol, "stocks")
+    d = nasdaq_get(f"/quote/{sym}/info?assetclass={cls}")
+    p = d.get("primaryData") or {}
+    price, chg = _num(p.get("lastSalePrice")), _num(p.get("netChange"))
+    ks = d.get("keyStats") or {}
+    out = {"price": price, "prev_close": (price - chg) if (price is not None and chg is not None) else None,
+           "volume": _num(p.get("volume")), "name": d.get("companyName"), "source": "Nasdaq.com"}
+    dr = ((ks.get("dayrange") or ks.get("dayRange") or {}).get("value") or "").split("-")
+    if len(dr) == 2:
+        out["day_low"], out["day_high"] = _num(dr[0]), _num(dr[1])
+    yr = ((ks.get("fiftyTwoWeekHighLow") or {}).get("value") or "").split("-")
+    if len(yr) == 2:
+        out["low52"], out["high52"] = _num(yr[0]), _num(yr[1])
+    s = d.get("secondaryData") or {}
+    if s.get("lastSalePrice") and p.get("isRealTime") is not None:
+        ext = _num(s.get("lastSalePrice"))
+        if ext and price and abs(ext - price) > 1e-9:
+            out["ext_price"] = ext
+    return out
+
+
+def nasdaq_intraday(symbol):
+    d = nasdaq_get(f"/quote/{symbol}/chart?assetclass=stocks")
+    pts = []
+    for row in d.get("chart") or []:
+        x, y = row.get("x"), _num(row.get("y"))
+        if x is None or y is None:
+            continue
+        # Nasdaq sends New York wall-clock time encoded as if it were UTC.
+        wall = datetime.fromtimestamp(x / 1000, timezone.utc).replace(tzinfo=None)
+        pts.append((int(wall.replace(tzinfo=ET_TZ).timestamp()), y, None))
+    return pts
+
+
 def stooq_quote(symbol):
     _, _, b = fetch(f"https://stooq.com/q/l/?s={symbol.lower()}.us&f=sd2t2ohlcv&h&e=csv")
     lines = b.decode("utf-8", "replace").strip().splitlines()
     d = dict(zip(lines[0].split(","), lines[1].split(",")))
-    return {"price": float(d["Close"]), "day_high": float(d["High"]), "day_low": float(d["Low"]),
-            "open": float(d["Open"]), "volume": float(d["Volume"])}
+    if _num(d.get("Close")) is None:
+        raise RuntimeError("Stooq has no data for " + symbol)
+    return {"price": _num(d["Close"]), "day_high": _num(d.get("High")), "day_low": _num(d.get("Low")),
+            "volume": _num(d.get("Volume")), "source": "Stooq (delayed)"}
+
+
+def save_points(sym, pts, replace=True):
+    if pts:
+        DB_.execute(("INSERT OR REPLACE" if replace else "INSERT OR IGNORE") +
+                    " INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
+                    [(sym, t, p, v) for t, p, v in pts], many=True)
 
 
 def collect_stock():
     sym = CFG["ticker"]
     quote = {"symbol": sym, "ipo_price": CFG["ipo_price"], "updated": int(time.time())}
+    errors = []
     try:
         r1 = yahoo_chart(sym, "1d", "1m", prepost=True)
         m = r1.get("meta", {})
         pts = series_points(r1)
         price = m.get("regularMarketPrice")
-        prev = m.get("chartPreviousClose") or m.get("previousClose")
         quote.update({
             "source": "Yahoo Finance",
             "name": m.get("longName") or m.get("shortName") or "Anthropic, PBC",
             "price": price,
-            "prev_close": prev,
-            "day_high": m.get("regularMarketDayHigh"),
-            "day_low": m.get("regularMarketDayLow"),
+            "prev_close": m.get("chartPreviousClose") or m.get("previousClose"),
+            "day_high": m.get("regularMarketDayHigh"), "day_low": m.get("regularMarketDayLow"),
             "volume": m.get("regularMarketVolume"),
-            "high52": m.get("fiftyTwoWeekHigh"),
-            "low52": m.get("fiftyTwoWeekLow"),
+            "high52": m.get("fiftyTwoWeekHigh"), "low52": m.get("fiftyTwoWeekLow"),
             "market_time": m.get("regularMarketTime"),
         })
-        # Latest extended-hours trade (pre/post market) if newer than the regular price.
-        if pts:
-            lt, lp, _ = pts[-1]
-            if m.get("regularMarketTime") and lt > m["regularMarketTime"] + 60 and price:
-                quote["ext_price"] = lp
-                quote["ext_time"] = lt
-        DB_.execute("INSERT OR REPLACE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
-                    [(sym, t, p, v) for t, p, v in pts], many=True)
+        if pts and m.get("regularMarketTime") and pts[-1][0] > m["regularMarketTime"] + 60 and price:
+            quote["ext_price"], quote["ext_time"] = pts[-1][1], pts[-1][0]
+        save_points(sym, pts)
         try:
-            r5 = yahoo_chart(sym, "5d", "5m", prepost=True)
-            DB_.execute("INSERT OR IGNORE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
-                        [(sym, t, p, v) for t, p, v in series_points(r5)], many=True)
+            save_points(sym, series_points(yahoo_chart(sym, "5d", "5m", prepost=True)), replace=False)
         except Exception as e:
             job_err("stock_5d", e)
     except Exception as e:
-        # Fallback: Stooq gives a delayed quote only.
+        errors.append(f"Yahoo: {e}")
+        for name, fn in (("Nasdaq", nasdaq_quote), ("Stooq", stooq_quote)):
+            try:
+                quote.update(fn(sym))
+                break
+            except Exception as e2:
+                errors.append(f"{name}: {e2}")
+        else:
+            raise RuntimeError("; ".join(errors))
         try:
-            s = stooq_quote(sym)
-            quote.update(s)
-            quote["source"] = "Stooq (delayed)"
-            DB_.execute("INSERT OR REPLACE INTO stock(symbol, ts, price, volume) VALUES(?,?,?,?)",
-                        (sym, int(time.time()), s["price"], None))
-            prev_q = STATE.get("quote") or {}
-            quote["prev_close"] = prev_q.get("prev_close")
-        except Exception as e2:
-            raise RuntimeError(f"Yahoo: {e}; Stooq: {e2}")
+            save_points(sym, nasdaq_intraday(sym))
+        except Exception as e3:
+            job_err("stock_history", f"Nasdaq chart: {e3}")
+            if quote.get("price") is not None:
+                save_points(sym, [(int(time.time()), quote["price"], None)])
+        if quote.get("prev_close") is None:
+            quote["prev_close"] = (STATE.get("quote") or {}).get("prev_close")
     p, pc = quote.get("price"), quote.get("prev_close")
     if p is not None and pc:
         quote["change"] = p - pc
@@ -341,12 +448,25 @@ def collect_stock():
         quote["ext_change_pct"] = (quote["ext_price"] - p) / p * 100
     if p is not None and CFG.get("shares_outstanding"):
         quote["market_cap_est"] = p * CFG["shares_outstanding"]
+    if errors:
+        quote["fallback_note"] = errors[0][:160]
     set_state("quote", quote)
 
 
 def collect_daily():
     sym = CFG["ticker"]
-    r = yahoo_chart(sym, "3mo", "1d")
+    try:
+        r = yahoo_chart(sym, "3mo", "1d")
+    except Exception:
+        # Without Yahoo, keep a daily close from the latest quote after the close.
+        q = STATE.get("quote") or {}
+        if q.get("price") is not None and market_state() in ("post", "closed"):
+            day = datetime.now(ET_TZ).date().isoformat()
+            if datetime.now(ET_TZ).weekday() < 5 and day not in HOLIDAYS:
+                DB_.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?,?,?)",
+                            (sym, day, None, q.get("day_high"), q.get("day_low"), q["price"], q.get("volume")))
+            return
+        raise
     ts = r.get("timestamp") or []
     q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
     rows = []
@@ -362,15 +482,23 @@ def collect_daily():
 def collect_peers():
     out = []
     for s in CFG.get("peers", []):
+        item = {"symbol": s, "name": s, "price": None, "change_pct": None}
         try:
             m = yahoo_chart(s, "1d", "5m").get("meta", {})
-            p, pc = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
-            out.append({"symbol": s, "name": m.get("shortName") or s, "price": p,
-                        "change_pct": ((p - pc) / pc * 100) if (p is not None and pc) else None})
+            item.update(price=m.get("regularMarketPrice"), pc=m.get("chartPreviousClose") or m.get("previousClose"),
+                        name=m.get("shortName") or s)
         except Exception as e:
-            out.append({"symbol": s, "name": s, "price": None, "change_pct": None, "error": str(e)[:120]})
+            try:
+                n = nasdaq_quote(s)
+                item.update(price=n.get("price"), pc=n.get("prev_close"), name=n.get("name") or s)
+            except Exception as e2:
+                item["error"] = f"{e}; {e2}"[:160]
+        p, pc = item.get("price"), item.pop("pc", None)
+        if p is not None and pc:
+            item["change_pct"] = (p - pc) / pc * 100
+        out.append(item)
     set_state("peers", out)
-    if all(x.get("price") is None for x in out) and out:
+    if out and all(x.get("price") is None for x in out):
         raise RuntimeError(out[0].get("error") or "no peer data")
 
 
@@ -449,26 +577,35 @@ STATE_LEVEL = {"operational": 0, "under_maintenance": 0, "degraded_performance":
                "partial_outage": 2, "major_outage": 3}
 
 
+# How status pages count downtime: major outage = down, partial outage = 30%, degraded = 0.
+LEVEL_WEIGHT = {0: 0.0, 1: 0.0, 2: 0.3, 3: 1.0}
+
+
 def build_timeline(start, end):
     """Per-component outage intervals from incidents + our own status snapshots."""
     with STATE_LOCK:
-        comps = [c["name"] for c in (STATE.get("status") or {}).get("components", [])]
+        comp_list = (STATE.get("status") or {}).get("components", [])
         incidents = list(STATE.get("recent_incidents") or [])
-    rows = {}
-    for name in comps:
-        rows[name] = []
+    comps = [c["name"] for c in comp_list]
+    current = {c["name"]: STATE_LEVEL.get(c["status"], 0) for c in comp_list}
+    rows = {name: [] for name in comps}
+    now = int(time.time())
     for inc in incidents:
         s = inc["created"]
-        e = inc["resolved"] or int(time.time())
+        e = inc["resolved"] or now
         if e < start or s > end:
             continue
-        lvl = IMPACT_LEVEL.get(inc.get("impact") or "minor", 1)
-        for cname in inc.get("components") or ["(unspecified)"]:
-            rows.setdefault(cname, []).append({"start": max(s, start), "end": min(e, end), "level": max(lvl, 1),
+        lvl = max(IMPACT_LEVEL.get(inc.get("impact") or "minor", 1), 1)
+        for cname in inc.get("components") or ["Other (no component listed)"]:
+            l = lvl
+            # An ongoing incident is drawn at the component's *current* severity, so a
+            # long-running "degraded" issue isn't shown as a multi-day outage.
+            if not inc["resolved"] and cname in current:
+                l = current[cname] or 1
+            rows.setdefault(cname, []).append({"start": max(s, start), "end": min(e, end), "level": l,
                                                "label": inc["name"], "url": inc.get("url")})
     snaps = DB_.query("SELECT ts, component, state FROM status_snap WHERE ts>=? ORDER BY ts", (start,))
-    open_iv = {}
-    last_ts = {}
+    open_iv, last_ts = {}, {}
     for ts, comp, state in snaps:
         lvl = STATE_LEVEL.get(state, 0)
         cur = open_iv.get(comp)
@@ -485,21 +622,24 @@ def build_timeline(start, end):
         cur["end"] = last_ts[comp]
         rows.setdefault(comp, []).append(cur)
     span = max(1, end - start)
+    step = 60
     out = []
     for name, ivs in rows.items():
         ivs.sort(key=lambda x: x["start"])
-        covered, cur_s, cur_e = 0, None, None
-        for iv in ivs:
-            if cur_e is None or iv["start"] > cur_e:
-                if cur_e is not None:
-                    covered += cur_e - cur_s
-                cur_s, cur_e = iv["start"], iv["end"]
-            else:
-                cur_e = max(cur_e, iv["end"])
-        if cur_e is not None:
-            covered += cur_e - cur_s
-        out.append({"component": name, "intervals": ivs, "uptime_pct": round(100 * (1 - covered / span), 2)})
-    # Snapshot coverage tells the page how far back our own sampling goes.
+        down = 0.0
+        if ivs:
+            # Minute by minute, take the worst level covering that minute.
+            n = span // step + 1
+            worst = bytearray(n)
+            for iv in ivs:
+                a = max(0, (iv["start"] - start) // step)
+                b = min(n - 1, (iv["end"] - start) // step)
+                for i in range(a, b + 1):
+                    if iv["level"] > worst[i]:
+                        worst[i] = iv["level"]
+            down = sum(LEVEL_WEIGHT.get(w, 0) for w in worst) * step
+        out.append({"component": name, "intervals": ivs,
+                    "uptime_pct": round(max(0.0, 100 * (1 - down / span)), 2)})
     first = DB_.query("SELECT MIN(ts) FROM status_snap")[0][0]
     return {"rows": out, "sampled_since": first}
 
@@ -924,6 +1064,76 @@ def save_usage(payload):
     return usage_view()
 
 
+# --------------------------------------------------------------------------- self-update
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "0"))
+
+
+def check_update():
+    _, _, b = fetch(f"https://raw.githubusercontent.com/{REPO}/{REPO_BRANCH}/claude_pulse/server.py?t={int(time.time())}")
+    m = re.search(rb'VERSION = "([^"]+)"', b)
+    if not m:
+        raise RuntimeError("couldn't read the version on GitHub")
+    latest = m.group(1).decode()
+    set_state("update", {"latest": latest, "checked": int(time.time()),
+                         "available": vtuple(latest) > vtuple(VERSION)})
+
+
+UPDATE_LOCK = threading.Lock()
+
+
+def do_update():
+    """Download the latest app from GitHub, replace the app files, then restart."""
+    if not UPDATE_LOCK.acquire(blocking=False):
+        raise RuntimeError("an update is already running")
+    try:
+        _, _, b = fetch(f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{REPO_BRANCH}", timeout=90)
+        tmp = tempfile.mkdtemp(prefix="claude-pulse-update-")
+        tar_path = os.path.join(tmp, "src.tgz")
+        with open(tar_path, "wb") as f:
+            f.write(b)
+        with tarfile.open(tar_path) as tf:
+            for mbr in tf.getmembers():
+                target = os.path.realpath(os.path.join(tmp, mbr.name))
+                if not target.startswith(os.path.realpath(tmp) + os.sep) or not (mbr.isfile() or mbr.isdir()):
+                    raise RuntimeError("unexpected file in update: " + mbr.name)
+            tf.extractall(tmp)
+        roots = [d for d in os.listdir(tmp) if d.startswith("claude-pulse-")]
+        if not roots:
+            raise RuntimeError("update archive looks wrong")
+        src_root = os.path.join(tmp, roots[0])
+        new_app = os.path.join(src_root, "claude_pulse")
+        with open(os.path.join(new_app, "server.py"), "rb") as f:
+            m = re.search(rb'VERSION = "([^"]+)"', f.read())
+        new_version = m.group(1).decode() if m else "?"
+        compile(open(os.path.join(new_app, "server.py")).read(), "server.py", "exec")  # refuse a broken file
+        # Copy app files over the installed ones (config and history live elsewhere).
+        for dirpath, _, files in os.walk(new_app):
+            rel = os.path.relpath(dirpath, new_app)
+            dst_dir = os.path.join(APP_DIR, rel) if rel != "." else APP_DIR
+            os.makedirs(dst_dir, exist_ok=True)
+            for fn in files:
+                tmp_dst = os.path.join(dst_dir, fn + ".new")
+                shutil.copy2(os.path.join(dirpath, fn), tmp_dst)
+                os.replace(tmp_dst, os.path.join(dst_dir, fn))
+        parent = os.path.dirname(APP_DIR)
+        for fn in ("README.md", "uninstall.sh", "install.sh", "get.sh", "config.example.json"):
+            src = os.path.join(src_root, fn)
+            if os.path.exists(src) and os.access(parent, os.W_OK):
+                shutil.copy2(src, os.path.join(parent, fn))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        def restart():
+            time.sleep(1.5)
+            os.execv(sys.executable, [sys.executable, os.path.join(APP_DIR, "server.py")])
+        threading.Thread(target=restart, daemon=True).start()
+        return {"ok": True, "from": VERSION, "to": new_version}
+    except Exception:
+        UPDATE_LOCK.release()
+        raise
+
+
 # --------------------------------------------------------------------------- scheduler
 
 KICK = threading.Event()
@@ -944,6 +1154,7 @@ JOBS = [
     ("openrouter", collect_or_stats, lambda: 300),
     ("probes", collect_probes, lambda: max(5, int(CFG.get("probe_interval_min", 15))) * 60),
     ("news", collect_news, lambda: 1200),
+    ("update_check", check_update, lambda: 6 * 3600),
     ("prune", lambda: prune(), lambda: 86400),
 ]
 
@@ -1016,6 +1227,7 @@ def api_state():
         "news": s["news"],
         "usage": usage_view(),
         "jobs": s["jobs"],
+        "update": s.get("update"),
     }
 
 
@@ -1104,6 +1316,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(n) or b"{}")
             if u.path == "/api/usage":
                 return self.send_json(save_usage(payload))
+            if u.path == "/api/update/check":
+                check_update()
+                return self.send_json({"version": VERSION, "update": STATE.get("update")})
+            if u.path == "/api/update":
+                return self.send_json(do_update())
             if u.path == "/api/refresh":
                 if time.time() - LAST_REFRESH[0] > 20:
                     LAST_REFRESH[0] = time.time()
