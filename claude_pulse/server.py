@@ -34,7 +34,7 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("CLAUDE_PULSE_DATA", os.path.expanduser("~/.local/share/claude-pulse"))
 CONFIG_PATH = os.environ.get("CLAUDE_PULSE_CONFIG", os.path.expanduser("~/.config/claude-pulse/config.json"))
 ET_TZ = ZoneInfo("America/New_York")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_CONFIG = {
     "bind": "0.0.0.0",
@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     "shares_outstanding": 13.37e9,
     "peers": ["^IXIC", "NVDA", "GOOGL", "AMZN", "MSFT"],
     "anthropic_api_key": "",
+    "openrouter_api_key": "",
+    "openrouter_models": [],
     "probe_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"],
     "probe_interval_min": 15,
     "status_base": "https://status.claude.com",
@@ -79,6 +81,8 @@ def load_config():
         print(f"[config] could not read {CONFIG_PATH}: {e}", file=sys.stderr)
     if os.environ.get("ANTHROPIC_API_KEY"):
         cfg["anthropic_api_key"] = os.environ["ANTHROPIC_API_KEY"]
+    if os.environ.get("OPENROUTER_API_KEY"):
+        cfg["openrouter_api_key"] = os.environ["OPENROUTER_API_KEY"]
     if os.environ.get("CLAUDE_PULSE_PORT"):
         cfg["port"] = int(os.environ["CLAUDE_PULSE_PORT"])
     if os.environ.get("CLAUDE_PULSE_OFFLINE") == "1":
@@ -109,6 +113,9 @@ class DB:
             CREATE TABLE IF NOT EXISTS probe (ts INTEGER, model TEXT, ok INTEGER, ttft REAL, total REAL,
                 out_tokens INTEGER, tps REAL, error TEXT);
             CREATE INDEX IF NOT EXISTS probe_ts ON probe(ts);
+            CREATE TABLE IF NOT EXISTS orstat (ts INTEGER, model TEXT, provider TEXT, ttft REAL, tps REAL,
+                up5 REAL, up30 REAL, up1d REAL);
+            CREATE INDEX IF NOT EXISTS orstat_ts ON orstat(ts);
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
             """)
             c.commit()
@@ -148,6 +155,9 @@ STATE = {
     "probes": {},
     "rate_limits": None,
     "available_models": [],
+    "or_models": [],
+    "or_watch": [],
+    "or_detail": {},
     "news": [],
     "jobs": {},
 }
@@ -625,16 +635,7 @@ def probe_summary():
         recent = [p for p in good if p[0] >= time.time() - 3600]
         load = None
         if last and last[1] and med_ttft and med_tps and last[3]:
-            ratio = ((last[2] / med_ttft) + (med_tps / last[3])) / 2
-            if ratio < 0.85:
-                label, level = "Faster than usual", 0
-            elif ratio < 1.2:
-                label, level = "Normal", 1
-            elif ratio < 1.6:
-                label, level = "Busy", 2
-            else:
-                label, level = "Very busy", 3
-            load = {"label": label, "level": level, "ratio": round(ratio, 2)}
+            load = load_label(last[2], last[3], med_ttft, med_tps)
         elif last and not last[1]:
             load = {"label": "Failing", "level": 3, "ratio": None}
         ok_rate = (sum(1 for p in pts if p[1]) / len(pts) * 100) if pts else None
@@ -652,14 +653,185 @@ def probe_summary():
 
 def hourly_profile():
     """Average time-to-first-token by hour of day (ET) across all stored probes."""
-    rows = DB_.query("SELECT ts, ttft FROM probe WHERE ok=1 AND ttft IS NOT NULL AND ts>=?",
-                     (int(time.time()) - 30 * 86400,))
+    since = int(time.time()) - 30 * 86400
+    rows = DB_.query("SELECT ts, ttft FROM orstat WHERE ttft IS NOT NULL AND ts>=? AND provider LIKE '%Anthropic%'",
+                     (since,))
+    if len(rows) < 24:
+        rows = DB_.query("SELECT ts, ttft FROM probe WHERE ok=1 AND ttft IS NOT NULL AND ts>=?", (since,))
     buckets = {}
     for ts, ttft in rows:
         h = datetime.fromtimestamp(ts, ET_TZ).hour
         buckets.setdefault(h, []).append(ttft)
     return [{"hour": h, "avg_ttft": statistics.mean(buckets[h]) if h in buckets else None,
              "n": len(buckets.get(h, []))} for h in range(24)]
+
+
+# --------------------------------------------------------------------------- OpenRouter (no Anthropic key needed)
+# Public stats from OpenRouter's real traffic to each Claude model. Uptime is public;
+# latency/throughput need a free OpenRouter key (no credits required).
+
+OR_BASE = "https://openrouter.ai/api/v1"
+RE_FAMILY = re.compile(r"claude-(haiku|sonnet|opus|fable|mythos)", re.I)
+
+
+def or_headers():
+    h = {"Accept": "application/json"}
+    if CFG.get("openrouter_api_key"):
+        h["Authorization"] = "Bearer " + CFG["openrouter_api_key"]
+    return h
+
+
+def load_label(ttft, tps, med_ttft, med_tps, up=None):
+    """Compare the latest speed to the model's usual speed."""
+    if ttft and tps and med_ttft and med_tps:
+        ratio = ((ttft / med_ttft) + (med_tps / tps)) / 2
+        if up is not None and up < 95:
+            return {"label": "Errors", "level": 3, "ratio": round(ratio, 2)}
+        if ratio < 0.85:
+            return {"label": "Faster than usual", "level": 0, "ratio": round(ratio, 2)}
+        if ratio < 1.2:
+            return {"label": "Normal", "level": 1, "ratio": round(ratio, 2)}
+        if ratio < 1.6:
+            return {"label": "Busy", "level": 2, "ratio": round(ratio, 2)}
+        return {"label": "Very busy", "level": 3, "ratio": round(ratio, 2)}
+    if up is not None:
+        if up >= 99:
+            return {"label": "Healthy", "level": 0, "ratio": None}
+        if up >= 95:
+            return {"label": "Some errors", "level": 2, "ratio": None}
+        return {"label": "Failing", "level": 3, "ratio": None}
+    return None
+
+
+def collect_or_models():
+    j = fetch_json(OR_BASE + "/models", headers=or_headers())
+    # Skip variants like ":thinking" / ":beta" - they're the same model.
+    ants = [m for m in j.get("data", []) if str(m.get("id", "")).startswith("anthropic/") and ":" not in m["id"]]
+    now = int(time.time())
+    seen = DB_.kv_get("seen_or_models")
+    baseline = seen is None
+    seen = seen or {}
+    for m in ants:
+        if m["id"] not in seen:
+            seen[m["id"]] = {"first_seen": now, "baseline": baseline}
+    DB_.kv_set("seen_or_models", seen)
+    out = []
+    for m in ants:
+        s = seen.get(m["id"], {})
+        name = re.sub(r"^Anthropic:\s*", "", m.get("name") or m["id"])
+        out.append({"id": m["id"], "display_name": name, "created": m.get("created"),
+                    "first_seen": s.get("first_seen"),
+                    "new": (not s.get("baseline")) and now - s.get("first_seen", 0) < 14 * 86400})
+    out.sort(key=lambda x: x.get("created") or 0, reverse=True)
+    set_state("or_models", out)
+    # Which models to watch: config list, else the newest model of each family.
+    watch = list(CFG.get("openrouter_models") or [])
+    if not watch:
+        best = {}
+        for m in out:
+            mid = m["id"]
+            if ":" in mid or re.search(r"(preview|beta|-\d{8})$", mid):
+                continue
+            fam = RE_FAMILY.search(mid)
+            if not fam:
+                continue
+            f = fam.group(1).lower()
+            if f not in best or (m.get("created") or 0) > (best[f].get("created") or 0):
+                best[f] = m
+        order = ["haiku", "sonnet", "opus", "fable", "mythos"]
+        watch = [best[f]["id"] for f in order if f in best]
+    set_state("or_watch", [{"id": w, "display_name": next((m["display_name"] for m in out if m["id"] == w), w)}
+                           for w in watch])
+
+
+def _ms_to_s(v):
+    if v is None:
+        return None
+    v = float(v)
+    return v / 1000.0 if v >= 30 else v  # docs say ms; guard in case seconds are sent
+
+
+def collect_or_stats():
+    with STATE_LOCK:
+        watch = [w["id"] for w in STATE.get("or_watch") or []]
+    if not watch:
+        collect_or_models()
+        with STATE_LOCK:
+            watch = [w["id"] for w in STATE.get("or_watch") or []]
+    now = int(time.time())
+    rows, detail, errors = [], {}, []
+    for slug in watch:
+        try:
+            j = fetch_json(f"{OR_BASE}/models/{slug}/endpoints", headers=or_headers())
+        except urllib.error.HTTPError as e:
+            errors.append(f"{slug}: HTTP {e.code}")
+            continue
+        except Exception as e:
+            errors.append(f"{slug}: {e}")
+            continue
+        eps = (j.get("data") or {}).get("endpoints") or []
+        detail[slug] = []
+        for ep in eps:
+            prov = ep.get("provider_name") or ep.get("tag") or "?"
+            ttft = _ms_to_s((ep.get("latency_last_30m") or {}).get("p50"))
+            tps = (ep.get("throughput_last_30m") or {}).get("p50")
+            r = (now, slug, prov, ttft, float(tps) if tps is not None else None,
+                 ep.get("uptime_last_5m"), ep.get("uptime_last_30m"), ep.get("uptime_last_1d"))
+            rows.append(r)
+            detail[slug].append({"provider": prov, "ttft": ttft, "tps": r[4], "up5": r[5], "up30": r[6], "up1d": r[7]})
+    if rows:
+        DB_.execute("INSERT INTO orstat VALUES(?,?,?,?,?,?,?,?)", rows, many=True)
+    set_state("or_detail", detail)
+    if errors and not rows:
+        raise RuntimeError("; ".join(errors)[:300])
+
+
+def main_provider(providers):
+    """Prefer Anthropic's own endpoint, else the first one listed."""
+    for p in providers:
+        if "anthropic" in p.lower():
+            return p
+    return providers[0] if providers else None
+
+
+def or_series(start):
+    rows = DB_.query("SELECT ts, model, provider, ttft, tps, up5, up30, up1d FROM orstat WHERE ts>=? ORDER BY ts",
+                     (start,))
+    by = {}
+    for ts, model, prov, ttft, tps, up5, up30, up1d in rows:
+        by.setdefault(model, {}).setdefault(prov, []).append((ts, ttft, tps, up5, up30, up1d))
+    out = {}
+    for model, provs in by.items():
+        mp = main_provider(list(provs))
+        out[model] = provs[mp] if mp else []
+    return out
+
+
+def or_summary():
+    with STATE_LOCK:
+        watch = list(STATE.get("or_watch") or [])
+        detail = dict(STATE.get("or_detail") or {})
+    series = or_series(int(time.time()) - 4 * 86400)
+    out = []
+    for w in watch:
+        pts = series.get(w["id"], [])
+        last = pts[-1] if pts else None
+        good_t = [p[1] for p in pts if p[1]]
+        good_s = [p[2] for p in pts if p[2]]
+        med_ttft = statistics.median(good_t) if len(good_t) >= 3 else None
+        med_tps = statistics.median(good_s) if len(good_s) >= 3 else None
+        provs = detail.get(w["id"], [])
+        mp = main_provider([p["provider"] for p in provs])
+        out.append({
+            "model": w["id"], "display_name": w["display_name"],
+            "provider": mp, "at": last[0] if last else None,
+            "ttft": last[1] if last else None, "tps": last[2] if last else None,
+            "up5": last[3] if last else None, "up30": last[4] if last else None, "up1d": last[5] if last else None,
+            "med_ttft": med_ttft, "med_tps": med_tps, "samples": len(pts),
+            "load": load_label(last[1], last[2], med_ttft, med_tps, last[4]) if last else None,
+            "others": [p for p in provs if p["provider"] != mp],
+        })
+    return out
 
 
 # --------------------------------------------------------------------------- news
@@ -768,6 +940,8 @@ JOBS = [
     ("status", collect_status, lambda: 120),
     ("incidents", collect_incidents, lambda: 600),
     ("models", collect_models, lambda: 3600),
+    ("or_models", collect_or_models, lambda: 3600),
+    ("openrouter", collect_or_stats, lambda: 300),
     ("probes", collect_probes, lambda: max(5, int(CFG.get("probe_interval_min", 15))) * 60),
     ("news", collect_news, lambda: 1200),
     ("prune", lambda: prune(), lambda: 86400),
@@ -776,7 +950,7 @@ JOBS = [
 
 def prune():
     cutoff = int(time.time()) - int(CFG.get("history_keep_days", 45)) * 86400
-    for t in ("stock", "status_snap", "probe"):
+    for t in ("stock", "status_snap", "probe", "orstat"):
         DB_.execute(f"DELETE FROM {t} WHERE ts<?", (cutoff,))
 
 
@@ -826,6 +1000,7 @@ def api_state():
         "market": {"state": ms, "next_open": next_market_open() if ms != "open" else None},
         "config": {"ticker": CFG["ticker"], "ipo_price": CFG["ipo_price"], "ipo_date": CFG.get("ipo_date"),
                    "has_key": bool(CFG.get("anthropic_api_key")), "probe_interval_min": CFG.get("probe_interval_min"),
+                   "has_or_key": bool(CFG.get("openrouter_api_key")),
                    "offline": bool(CFG.get("offline"))},
         "quote": s["quote"],
         "peers": s["peers"],
@@ -833,8 +1008,11 @@ def api_state():
         "recent_incidents": s["recent_incidents"],
         "upcoming_maint": s["upcoming_maint"],
         "probes": probe_summary(),
+        "speed": or_summary(),
         "rate_limits": s["rate_limits"],
-        "available_models": s["available_models"],
+        # Anthropic's own model list when a key is set, otherwise OpenRouter's public list.
+        "available_models": s["available_models"] or s["or_models"],
+        "models_source": "Anthropic API" if s["available_models"] else ("OpenRouter" if s["or_models"] else None),
         "news": s["news"],
         "usage": usage_view(),
         "jobs": s["jobs"],
@@ -859,6 +1037,7 @@ def api_history(days):
         "stock": [[t, p, v] for t, p, v in stock],
         "daily": [list(r) for r in daily],
         "probes": probes,
+        "orstats": {m: [list(p) for p in pts] for m, pts in or_series(start).items()},
         "timeline": build_timeline(start, end),
         "hourly": hourly_profile(),
     }

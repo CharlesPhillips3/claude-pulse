@@ -44,21 +44,34 @@ fi
 chmod 600 "$CONF"
 PORT="$(python3 -c "import json;print(json.load(open('$CONF')).get('port',8787))" 2>/dev/null || echo 8787)"
 
-# Optional: ask for an API key so model speed probes work.
-# Reads from /dev/tty so this also works with: curl ... | bash
-if [ -z "${CLAUDE_PULSE_NO_PROMPT:-}" ] && ( : </dev/tty ) 2>/dev/null && exec 3</dev/tty && ! grep -q '"anthropic_api_key": *"sk-' "$CONF"; then
-  echo
-  echo "Optional: paste an Anthropic API key (sk-ant-...) to measure model speed + API rate limits."
-  echo "It stays in $CONF (readable only by you). Press Enter to skip."
-  KEY=""; read -r -s -p "API key: " KEY <&3 || true; echo; exec 3<&-
-  if [ -n "${KEY:-}" ]; then
-    CONF="$CONF" KEY="$KEY" python3 - <<'PY'
+# Optional keys. Reads from /dev/tty so this also works with: curl ... | bash
+save_key() {  # $1 = config field, $2 = value
+  CONF="$CONF" FIELD="$1" KEY="$2" python3 - <<'PY'
 import json, os
-p = os.environ["CONF"]; c = json.load(open(p)); c["anthropic_api_key"] = os.environ["KEY"].strip()
+p = os.environ["CONF"]; c = json.load(open(p)); c[os.environ["FIELD"]] = os.environ["KEY"].strip()
 json.dump(c, open(p, "w"), indent=2)
 PY
-    echo "==> API key saved."
+}
+has_key() { python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONF')).get('$1') else 1)"; }
+if [ -z "${CLAUDE_PULSE_NO_PROMPT:-}" ] && ( : </dev/tty ) 2>/dev/null; then
+  exec 3</dev/tty
+  if ! has_key openrouter_api_key; then
+    echo
+    echo "Recommended: a FREE OpenRouter key (no credits needed) gives live speed for every Claude model."
+    echo "  Get one at https://openrouter.ai/settings/keys  (sign in -> Create Key)"
+    echo "Paste it and press Enter (nothing shows while you paste), or just press Enter to skip."
+    KEY=""; read -r -s -p "OpenRouter key: " KEY <&3 || true; echo
+    [ -n "$KEY" ] && save_key openrouter_api_key "$KEY" && echo "==> OpenRouter key saved."
   fi
+  if ! has_key anthropic_api_key; then
+    echo
+    echo "Optional: an Anthropic API key (sk-ant-...) adds your own API rate limits and instant new-model alerts."
+    echo "Most people can skip this. Press Enter to skip."
+    KEY=""; read -r -s -p "Anthropic key: " KEY <&3 || true; echo
+    [ -n "$KEY" ] && save_key anthropic_api_key "$KEY" && echo "==> Anthropic key saved."
+  fi
+  exec 3<&-
+  echo "Keys are stored in $CONF (readable only by you)."
 fi
 
 # --- systemd service

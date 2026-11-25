@@ -141,10 +141,10 @@ footer{grid-column:span 12;color:var(--dim);font-size:12px;text-align:center;pad
     <h2>Models · speed &amp; load <span class="right muted" id="probeInfo"></span></h2>
     <div id="modelsNote"></div>
     <table id="modelTable"></table>
-    <h2 style="margin-top:16px">Time to first token · last 4 days <span class="right muted">lower is faster</span></h2>
+    <h2 style="margin-top:16px"><span id="ttftTitle">Time to first token · last 4 days</span> <span class="right muted" id="ttftHint">lower is faster</span></h2>
     <div class="chart" id="ttftChart"></div>
     <div class="legend" id="ttftLegend"></div>
-    <h2 style="margin-top:16px">Output speed · tokens/second <span class="right muted">higher is faster</span></h2>
+    <h2 style="margin-top:16px"><span id="tpsTitle">Output speed · tokens/second</span> <span class="right muted">higher is faster</span></h2>
     <div class="chart" id="tpsChart"></div>
     <h2 style="margin-top:16px">Busiest hours (ET) <span class="right muted">avg wait for first token, all models</span></h2>
     <div id="hours"></div>
@@ -394,35 +394,68 @@ function renderTimeline() {
 // ---------- models
 const TYPICAL = {haiku: "Fastest, cheapest", sonnet: "Fast all-rounder", opus: "Slower, most capable everyday model", fable: "Slowest, top tier (Mythos-class)", mythos: "Slowest, top tier"};
 function typical(id) { const k = Object.keys(TYPICAL).find(k => id.includes(k)); return k ? TYPICAL[k] : ""; }
+function speedSource() {
+  // OpenRouter speed first, then your own probes, then OpenRouter uptime only.
+  const sp = S.speed || [], pr = S.probes || [];
+  if (sp.some(r => r.ttft != null)) return {src: "or", rows: sp};
+  if (S.config.has_key && pr.some(r => r.ttft != null)) return {src: "probe", rows: pr};
+  if (sp.length && (sp.some(r => r.at) || !S.config.has_key)) return {src: "or", rows: sp};
+  return {src: "probe", rows: pr};
+}
 function renderModels() {
-  const pr = S.probes || [];
-  $("#probeInfo").textContent = S.config.has_key ? `probed every ${S.config.probe_interval_min} min` : "";
-  if (!S.config.has_key) {
-    $("#modelsNote").innerHTML = `<div class="warnbox">Speed probes are off. Add an Anthropic API key in <code>~/.config/claude-pulse/config.json</code> (see README) and this Pi will time each model every ${S.config.probe_interval_min} minutes — a tiny request, about a cent a day. Until then, load comes from the status page only.</div>`;
-  } else $("#modelsNote").innerHTML = S.jobs.probes?.err ? `<div class="errbox">Probe error: ${esc(S.jobs.probes.err)}</div>` : "";
-  const maxTps = Math.max(1, ...pr.map(p => p.tps || 0));
+  const {src, rows} = speedSource();
+  const hasSpeed = rows.some(r => r.ttft != null);
+  let note = "";
+  if (src === "or") {
+    $("#probeInfo").textContent = "OpenRouter · every 5 min";
+    if (!hasSpeed && rows.some(r => r.at) && !S.config.has_or_key)
+      note += `<div class="warnbox">Uptime is live. For speed numbers, add a <b>free OpenRouter key</b> (no credits needed): sign in at openrouter.ai → <b>Keys</b> → Create, then put it in <code>~/.config/claude-pulse/config.json</code> as <code>"openrouter_api_key"</code> and run <code>sudo systemctl restart claude-pulse</code>.</div>`;
+    if (S.jobs.openrouter?.err) note += `<div class="errbox">OpenRouter: ${esc(S.jobs.openrouter.err)}</div>`;
+    note += `<div class="note" style="margin:0 0 8px">Live from OpenRouter's real traffic to each Claude model: median of the last 30 minutes${rows[0]?.provider ? ", " + esc(rows[0].provider) + " endpoint" : ""}.</div>`;
+  } else {
+    $("#probeInfo").textContent = S.config.has_key ? `your probes · every ${S.config.probe_interval_min} min` : "";
+    if (!S.config.has_key) note = `<div class="warnbox">Waiting for OpenRouter data${S.jobs.openrouter?.err ? " (" + esc(S.jobs.openrouter.err) + ")" : ""}… Load also comes from the status page.</div>`;
+    else if (S.jobs.probes?.err) note = `<div class="errbox">Probe error: ${esc(S.jobs.probes.err)}</div>`;
+  }
+  $("#modelsNote").innerHTML = note;
+  const maxTps = Math.max(1, ...rows.map(p => p.tps || 0));
   const apiComp = (S.status?.components || []).find(c => /api/i.test(c.name));
-  $("#modelTable").innerHTML = `<tr><th>Model</th><th>Load</th><th class="num">First token</th><th class="num">Tokens/s</th><th class="num hide-sm">Usual</th><th class="num hide-sm">OK (4d)</th></tr>` +
-    pr.map((p, i) => {
+  const lastHead = src === "or" ? "Uptime 30m" : "OK (4d)";
+  $("#modelTable").innerHTML = `<tr><th>Model</th><th>Load</th><th class="num">First token</th><th class="num">Tokens/s</th><th class="num hide-sm">Usual</th><th class="num">${lastHead}</th></tr>` +
+    rows.map((p, i) => {
       const loadLabel = p.load ? `<span class="dot l${p.load.level}"></span> ${esc(p.load.label)}` : apiComp ? `<span class="dot l${compLvl(apiComp.status) ?? ""}"></span> <span class="muted">${esc(apiComp.status.replace(/_/g, " "))}</span>` : "—";
-      return `<tr><td><span style="color:${COLORS[i % COLORS.length]}">●</span> <b>${esc(p.display_name)}</b><div class="dim hide-sm" style="font-size:11px">${esc(p.model)} · ${esc(typical(p.model))}</div>${p.error && !p.ok ? `<div class="down" style="font-size:11px">${esc(p.error)}</div>` : ""}</td>
+      const others = (p.others || []).filter(o => o.up30 != null).map(o => `${esc(o.provider)} ${o.up30.toFixed(1)}%`).join(" · ");
+      const last = src === "or" ? (p.up30 != null ? `<span class="${p.up30 < 99 ? "down" : ""}">${p.up30.toFixed(1)}%</span>` : "—") : (p.success_pct != null ? p.success_pct.toFixed(0) + "%" : "—");
+      return `<tr><td><span style="color:${COLORS[i % COLORS.length]}">●</span> <b>${esc(p.display_name)}</b><div class="dim hide-sm" style="font-size:11px">${esc(p.model)} · ${esc(typical(p.model))}</div>${others ? `<div class="dim hide-sm" style="font-size:11px">Also: ${others}</div>` : ""}${p.error && !p.ok && src === "probe" ? `<div class="down" style="font-size:11px">${esc(p.error)}</div>` : ""}</td>
       <td>${loadLabel}${p.at ? `<div class="dim" style="font-size:11px">${esc(ago(p.at))}</div>` : ""}</td>
       <td class="num">${fmtSec(p.ttft)}</td>
       <td class="num">${p.tps != null ? p.tps.toFixed(0) : "—"}<span class="speedbar"><div style="width:${(p.tps || 0) / maxTps * 100}%"></div></span></td>
       <td class="num muted hide-sm">${p.med_ttft != null ? fmtSec(p.med_ttft) + " · " + (p.med_tps ? p.med_tps.toFixed(0) + "/s" : "—") : "—"}</td>
-      <td class="num muted hide-sm">${p.success_pct != null ? p.success_pct.toFixed(0) + "%" : "—"}</td></tr>`;
-    }).join("");
+      <td class="num muted">${last}</td></tr>`;
+    }).join("") + (rows.length ? "" : `<tr><td colspan="6" class="empty">Loading model list…</td></tr>`);
 }
 function renderProbeCharts() {
   if (!H || !S) return;
-  const models = (S.probes || []).map(p => p.model);
+  const {src, rows} = speedSource();
   const start = H.end - 4 * 86400;
-  const ticks = []; for (let t = start; t <= H.end; t += 3600) { const d = new Date(t * 1000); if (d.getHours() === 0 && d.getMinutes() < 60) { d.setMinutes(0, 0, 0); ticks.push([d.getTime() / 1000, d.toLocaleDateString(undefined, {weekday: "short", month: "numeric", day: "numeric"})]); } }
-  const mk = idx => models.map((m, i) => ({name: (S.probes[i].display_name || m), color: COLORS[i % COLORS.length], noDots: true, points: (H.probes[m] || []).filter(r => r[1]).map(r => [r[0], r[idx]])}));
-  const empty = S.config.has_key ? "Speed history builds up as probes run." : "Add an API key to chart model speed.";
-  lineChart($("#ttftChart"), mk(2), {height: 190, xMin: start, xMax: H.end, xTicks: ticks, yZero: true, yFmt: v => v.toFixed(1) + "s", tipFmt: v => fmtSec(v), gap: 3 * 3600, maxSnap: 3600, empty});
-  lineChart($("#tpsChart"), mk(3), {height: 170, xMin: start, xMax: H.end, xTicks: ticks, yZero: true, yFmt: v => v.toFixed(0), tipFmt: v => v.toFixed(0) + " tok/s", gap: 3 * 3600, maxSnap: 3600, empty});
-  $("#ttftLegend").innerHTML = models.map((m, i) => `<span><i style="background:${COLORS[i % COLORS.length]}"></i>${esc(S.probes[i].display_name)}</span>`).join("");
+  const ticks = []; for (let t = start; t <= H.end; t += 3600) { const d = new Date(t * 1000); if (d.getHours() === 0) { d.setMinutes(0, 0, 0); ticks.push([d.getTime() / 1000, d.toLocaleDateString(undefined, {weekday: "short", month: "numeric", day: "numeric"})]); } }
+  // orstats rows: [ts, ttft, tps, up5, up30, up1d]; probe rows: [ts, ok, ttft, tps]
+  const data = m => src === "or" ? (H.orstats?.[m] || []) : (H.probes[m] || []).filter(r => r[1]);
+  const col = src === "or" ? {ttft: 1, tps: 2, up: 4} : {ttft: 2, tps: 3};
+  const mk = idx => rows.map((p, i) => ({name: p.display_name || p.model, color: COLORS[i % COLORS.length], noDots: true, points: data(p.model).map(r => [r[0], r[idx]])}));
+  const hasT = mk(col.ttft).some(s => s.points.some(p => p[1] != null));
+  const empty = src === "or" ? "Builds up as data is collected (every 5 minutes)." : (S.config.has_key ? "Speed history builds up as probes run." : "Waiting for speed data.");
+  const base = {xMin: start, xMax: H.end, xTicks: ticks, gap: 3 * 3600, maxSnap: 3600, empty};
+  if (!hasT && src === "or" && mk(col.up).some(s => s.points.length)) {
+    $("#ttftTitle").textContent = "Uptime (30-min window) · last 4 days"; $("#ttftHint").textContent = "higher is better";
+    lineChart($("#ttftChart"), mk(col.up), {...base, height: 190, yFmt: v => v.toFixed(1) + "%", tipFmt: v => v.toFixed(2) + "%"});
+  } else {
+    $("#ttftTitle").textContent = "Time to first token · last 4 days"; $("#ttftHint").textContent = "lower is faster";
+    lineChart($("#ttftChart"), mk(col.ttft), {...base, height: 190, yZero: true, yFmt: v => v.toFixed(1) + "s", tipFmt: v => fmtSec(v)});
+  }
+  lineChart($("#tpsChart"), mk(col.tps), {...base, height: 170, yZero: true, yFmt: v => v.toFixed(0), tipFmt: v => v.toFixed(0) + " tok/s",
+    empty: src === "or" && !S.config.has_or_key ? "Add a free OpenRouter key to chart speed." : empty});
+  $("#ttftLegend").innerHTML = rows.map((p, i) => `<span><i style="background:${COLORS[i % COLORS.length]}"></i>${esc(p.display_name)}</span>`).join("");
   // Busiest hours
   const hrs = H.hourly || []; const vals = hrs.map(h => h.avg_ttft).filter(v => v != null);
   if (vals.length < 6) {
@@ -486,11 +519,10 @@ function renderRadar() {
   const am = S.available_models || [];
   const fresh = am.filter(m => m.new);
   let h = "";
-  if (!S.config.has_key) h = `<div class="dim" style="font-size:13px">With an API key, this checks Anthropic's model list every hour and flags any new model the moment it goes live.</div>`;
-  else if (!am.length) h = `<div class="dim">Checking model list…</div>`;
+  if (!am.length) h = `<div class="dim">Checking model list…</div>`;
   else {
     h = fresh.length ? fresh.map(m => `<div class="item"><span class="tag new">new</span><b>${esc(m.display_name)}</b><div class="meta">${esc(m.id)} · spotted ${esc(ago(m.first_seen))}</div></div>`).join("")
-      : `<div class="muted" style="font-size:13px">No new models since this Pi started watching. Newest available:</div>`;
+      : `<div class="muted" style="font-size:13px">No new models since this Pi started watching (checks ${esc(S.models_source || "")} hourly). Newest available:</div>`;
     h += `<table style="margin-top:6px">${am.slice(0, 6).map(m => `<tr><td>${esc(m.display_name)}<div class="dim" style="font-size:11px">${esc(m.id)}</div></td><td class="num muted">${m.created ? esc(new Date(m.created * 1000).toLocaleDateString()) : ""}</td></tr>`).join("")}</table>`;
   }
   $("#newModels").innerHTML = h;
@@ -503,7 +535,7 @@ function renderNews() {
 }
 function renderFooter() {
   const bad = Object.entries(S.jobs || {}).filter(([, j]) => j.err);
-  $("#footer").innerHTML = `Claude Pulse ${esc(S.version)} · runs on this Pi · Data: Yahoo Finance / Stooq (quotes may be delayed), status.claude.com, Anthropic API, Google News. Not investment advice.`
+  $("#footer").innerHTML = `Claude Pulse ${esc(S.version)} · runs on this Pi · Data: Yahoo Finance / Stooq (quotes may be delayed), status.claude.com, OpenRouter, Anthropic API (optional), Google News. Not investment advice.`
     + (bad.length ? `<div style="margin-top:6px;color:#c98a7f">Problems: ${bad.map(([k, j]) => esc(k) + " (" + esc(j.err) + ")").join(" · ")}</div>` : "");
 }
 
